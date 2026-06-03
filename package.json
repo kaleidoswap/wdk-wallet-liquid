@@ -1,0 +1,81 @@
+{
+  "name": "@kaleidorg/wdk-wallet-liquid",
+  "version": "1.0.0-beta.2",
+  "description": "WDK wallet adapter for the Liquid network — wraps an in-process LWK (Liquid Wallet Kit) wallet in the WDK account model.",
+  "keywords": [
+    "wdk",
+    "wallet",
+    "liquid",
+    "lwk",
+    "elements",
+    "bitcoin",
+    "kaleidoswap"
+  ],
+  "author": "KaleidoSwap",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kaleidoswap/wdk-wallet-liquid"
+  },
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": {
+      "types": "./types/index.d.ts",
+      "bare": "./bare.js",
+      "default": "./index.js"
+    }
+  },
+  "imports": {
+    "#lwk": {
+      "react-native": "./src/lwk-native.js",
+      "browser": "./src/lwk-web.js",
+      "bare": "./src/lwk-node.js",
+      "node": "./src/lwk-node.js",
+      "default": "./src/lwk-node.js"
+    }
+  },
+  "files": [
+    "index.js",
+    "bare.js",
+    "src/",
+    "types/",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "cross-env NODE_OPTIONS=--experimental-vm-modules jest",
+    "test:coverage": "cross-env NODE_OPTIONS=--experimental-vm-modules jest --coverage"
+  },
+  "dependencies": {
+    "lwk_node": "^0.17.1"
+  },
+  "peerDependencies": {
+    "@tetherto/wdk-wallet": "^1.0.0-beta.6",
+    "lwk_wasm": "^0.17.2",
+    "lwk-rn": "^0.9.0-2.0.3"
+  },
+  "peerDependenciesMeta": {
+    "lwk_wasm": {
+      "optional": true
+    },
+    "lwk-rn": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@tetherto/wdk-wallet": "^1.0.0-beta.7",
+    "bare-node-runtime": "^1.1.4",
+    "cross-env": "7.0.3",
+    "jest": "30.1.3"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "standard": {
+    "ignore": [
+      "bare.js",
+      "tests/**/*.js"
+    ]
+  }
+}
