@@ -223,7 +223,7 @@ describe('LiquidAccount', () => {
     const account = new LiquidAccount({ mnemonic: SEED })
     account._ensureReady()
     const addr = await account.getAddress()
-    const state = { recipients: [], feeRates: [] }
+    const state = { recipients: [], feeRates: [], drainWallet: 0, drainTo: 0 }
     function makeBuilder () {
       let dead = false
       const consume = () => {
@@ -233,11 +233,17 @@ describe('LiquidAccount', () => {
       return {
         addLbtcRecipient (_a, sats) { consume(); state.recipients.push({ sats }); return makeBuilder() },
         addRecipient (_a, sats, asset) { consume(); state.recipients.push({ sats, asset: String(asset) }); return makeBuilder() },
+        drainLbtcWallet () { consume(); state.drainWallet++; return makeBuilder() },
+        drainLbtcTo (_a) { consume(); state.drainTo++; return makeBuilder() },
         feeRate (r) { consume(); state.feeRates.push(r); return makeBuilder() },
         finish () { consume(); return { fake: 'pset' } }
       }
     }
     account._network.txBuilder = () => makeBuilder()
+    // A partial-amount send must use addLbtcRecipient, not drain — give the
+    // wallet an L-BTC balance well above the 1000 sat sent below.
+    account._network.policyAsset = () => ({ toString: () => 'lbtc' })
+    account._wollet.balance = () => new Map([['lbtc', 1_000_000n]])
     account._wollet.psetDetails = () => ({ balance: () => ({ fee: () => 250 }) })
     account._signer.sign = (pset) => pset
     account._wollet.finalize = (pset) => pset
@@ -246,6 +252,7 @@ describe('LiquidAccount', () => {
     account._lastSyncAt = Date.now() // fresh — the forced pre-send scan is skipped
     const btc = await account.transfer({ recipient: addr, amount: 1000n })
     expect(btc).toEqual({ hash: 'txid-stub', fee: 250n })
+    expect(state.drainWallet).toBe(0) // partial amount → no drain
 
     account._lastSyncAt = Date.now()
     const asset = await account.sendAsset({
@@ -328,6 +335,43 @@ describe('LiquidAccount', () => {
     }
     await account._sync(true)
     expect(recipientCalls).toBe(0)
+    account.dispose()
+  })
+
+  test('transfer of the full L-BTC balance drains (fee deducted, not added on top)', async () => {
+    // addLbtcRecipient(fullBalance) would add the fee ON TOP → lwk "Insufficient
+    // funds: missing <fee> units for asset <L-BTC>". Sending the entire balance
+    // must drain instead (drainLbtcWallet + drainLbtcTo), which nets out the fee.
+    const account = new LiquidAccount({ mnemonic: SEED })
+    account._ensureReady()
+    const addr = await account.getAddress()
+    const calls = { addLbtc: 0, drainWallet: 0, drainTo: 0 }
+    function makeBuilder () {
+      let dead = false
+      const consume = () => { if (dead) throw new Error('null pointer passed to rust'); dead = true }
+      return {
+        addLbtcRecipient () { consume(); calls.addLbtc++; return makeBuilder() },
+        drainLbtcWallet () { consume(); calls.drainWallet++; return makeBuilder() },
+        drainLbtcTo () { consume(); calls.drainTo++; return makeBuilder() },
+        feeRate () { consume(); return makeBuilder() },
+        finish () { consume(); return { fake: 'pset' } }
+      }
+    }
+    account._network.txBuilder = () => makeBuilder()
+    account._network.policyAsset = () => ({ toString: () => 'lbtc' })
+    account._wollet.balance = () => new Map([['lbtc', 5_000n]])
+    account._wollet.psetDetails = () => ({ balance: () => ({ fee: () => 42 }) })
+    account._signer.sign = (pset) => pset
+    account._wollet.finalize = (pset) => pset
+    account._esplora = { fullScan: async () => null, broadcast: async () => 'txid-max' }
+
+    account._lastSyncAt = Date.now()
+    const res = await account.transfer({ recipient: addr, amount: 5_000n }) // == full balance
+    expect(res).toEqual({ hash: 'txid-max', fee: 42n })
+    expect(calls.drainWallet).toBe(1)
+    expect(calls.drainTo).toBe(1)
+    expect(calls.addLbtc).toBe(0) // never the fee-on-top path
+
     account.dispose()
   })
 
