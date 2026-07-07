@@ -21,6 +21,8 @@ export interface LiquidWalletConfig {
   esploraUrl?: string
   /** BIP-39 mnemonic; required only when the seed is passed as bytes. */
   mnemonic?: string
+  /** Watchdog for a wedged Esplora full-scan, in ms (default: 30000). */
+  scanTimeoutMs?: number
 }
 
 export interface TransferResult {
@@ -43,12 +45,20 @@ export interface LiquidUnspent {
   height: number | null
 }
 
+export interface LiquidTxBalance {
+  asset_id: string
+  /** Net wallet delta for this asset (signed), in the asset's smallest unit. */
+  value: string
+}
+
 export interface LiquidTransaction {
   txid: string
   type: string
   fee: string
   height: number | null
   timestamp: number | null
+  /** Per-asset net balance change for this tx (positive = received). */
+  balance: LiquidTxBalance[]
 }
 
 export interface LiquidAssetBalance {
@@ -64,7 +74,7 @@ export interface LiquidNetworkInfo {
 }
 
 export class LiquidAccount {
-  constructor (config: { mnemonic: string, network?: LiquidNetworkName, esploraUrl?: string })
+  constructor (config: { mnemonic: string, network?: LiquidNetworkName, esploraUrl?: string, scanTimeoutMs?: number })
 
   getAddress (): Promise<string>
   getBalance (): Promise<bigint>

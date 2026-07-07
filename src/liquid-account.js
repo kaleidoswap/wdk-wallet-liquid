@@ -27,6 +27,7 @@ import lwk from '#lwk'
  * @property {string} mnemonic - BIP-39 mnemonic phrase used to derive the signer.
  * @property {LiquidNetworkName} [network] - Liquid network (default: 'testnet').
  * @property {string} [esploraUrl] - Esplora API base URL (default: the network's built-in client).
+ * @property {number} [scanTimeoutMs] - Watchdog for a wedged Esplora full-scan (default: 30000).
  */
 
 function buildNetwork (name) {
@@ -37,6 +38,28 @@ function buildNetwork (name) {
     default: return lwk.Network.testnet()
   }
 }
+
+// How long a completed Esplora full-scan stays "fresh". A burst of reads
+// (balance + assets + address, fired together by a UI) shares one scan instead
+// of each triggering its own — critical because ops are serialized (see `_run`),
+// so N scans would run back-to-back and blow the caller's timeout. Sized to the
+// typical 30s UI refresh so navigating between screens (e.g. dashboard → send)
+// and composing a payment reuse the last scan instead of blocking on a new one;
+// a manual refresh or a send forces a fresh scan (`resync()` / `_sync(true)`).
+const SYNC_TTL_MS = 30_000
+
+// Even a FORCED scan reuses one that completed this recently. A "refresh
+// everything" UI action fans out to several forced syncs (refresh-balances,
+// snapshot rebuild, send prep); without this window each of them would run its
+// own back-to-back full scan.
+const FORCE_SYNC_TTL_MS = 2_500
+
+// Watchdog for a wedged scan. The fetch stack under lwk's `fullScan` has no
+// timeout of its own; a stalled request would otherwise hold the serialized op
+// queue (and with it every balance/status read) hostage forever. On timeout the
+// whole LWK object graph is orphaned and lazily rebuilt by the next op — safe
+// because the zombie scan only ever touches the orphaned Wollet.
+const DEFAULT_SCAN_TIMEOUT_MS = 30_000
 
 /**
  * WDK-compatible account that wraps an in-process LWK (Liquid Wallet Kit)
@@ -61,7 +84,12 @@ export class LiquidAccount {
     this._mnemonic = config.mnemonic
     this._networkName = config.network ?? 'testnet'
     this._esploraUrl = config.esploraUrl ?? null
+    this._scanTimeoutMs = config.scanTimeoutMs ?? DEFAULT_SCAN_TIMEOUT_MS
     this._ready = false
+    // FIFO queue serializing every op that borrows the LWK Wollet (see `_run`).
+    this._opChain = Promise.resolve()
+    // Epoch ms of the last completed Esplora scan (0 = never); see `_sync`.
+    this._lastSyncAt = 0
   }
 
   /**
@@ -77,8 +105,11 @@ export class LiquidAccount {
     this._signer = new lwk.Signer(new lwk.Mnemonic(this._mnemonic), this._network)
     this._descriptor = this._signer.wpkhSlip77Descriptor()
     this._wollet = new lwk.Wollet(this._network, this._descriptor)
+    // EsploraClient(network, url, waterfalls, concurrency, utxo_only). A
+    // gap-limit full-scan issues ~40+ requests; concurrency 1 serializes them
+    // into a 10s+ scan, so use 4 to keep the first scan responsive.
     this._esplora = this._esploraUrl
-      ? new lwk.EsploraClient(this._network, this._esploraUrl, false, 1, false)
+      ? new lwk.EsploraClient(this._network, this._esploraUrl, false, 4, false)
       : this._network.defaultEsploraClient()
 
     this._ready = true
@@ -90,10 +121,82 @@ export class LiquidAccount {
    *
    * @private
    */
-  async _sync () {
+  /**
+   * Scans the chain via Esplora and applies the update. Coalesces rapid calls:
+   * a scan that completed within `SYNC_TTL_MS` is reused (returns immediately)
+   * unless `force` is set. lwk's `fullScan` is a full gap-limit scan (seconds
+   * over a remote Esplora), and reads are serialized (`_run`), so without this a
+   * burst of reads would run N scans back-to-back and exceed the caller's
+   * timeout. Sends pass `force` so they always build against fresh UTXOs.
+   *
+   * @private
+   * @param {boolean} [force=false]
+   */
+  async _sync (force = false) {
     this._ensureReady()
-    const update = await this._esplora.fullScan(this._wollet)
-    if (update) this._wollet.applyUpdate(update)
+    const freshness = force ? FORCE_SYNC_TTL_MS : SYNC_TTL_MS
+    if (this._lastSyncAt && (Date.now() - this._lastSyncAt) < freshness) return
+    const t0 = Date.now()
+    console.info(`[LiquidAccount] fullScan start (${this._networkName}, ${this._esploraUrl ?? 'default esplora'})`)
+    let timer
+    try {
+      const timeout = new Promise((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`LiquidAccount: fullScan timed out after ${this._scanTimeoutMs}ms`)),
+          this._scanTimeoutMs
+        )
+      })
+      const update = await Promise.race([this._esplora.fullScan(this._wollet), timeout])
+      if (update) this._wollet.applyUpdate(update)
+      this._lastSyncAt = Date.now()
+      console.info(`[LiquidAccount] fullScan done in ${Date.now() - t0}ms`)
+    } catch (err) {
+      console.error(`[LiquidAccount] fullScan FAILED after ${Date.now() - t0}ms:`, err?.message ?? err)
+      if (/timed out/.test(String(err?.message ?? ''))) {
+        // The wedged scan may still hold the &mut Wollet borrow inside wasm, so
+        // none of the current objects are safe to touch again. Orphan the whole
+        // graph — the next op's `_ensureReady()` rebuilds fresh objects, and the
+        // zombie scan finishes (or dies) against the orphan without conflict.
+        // Deliberately no free()/dispose() here: freeing a borrowed wasm object
+        // would abort; leaking it is harmless.
+        this._ready = false
+      }
+      throw err
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  /**
+   * Forces a fresh Esplora scan on the next read, bypassing the freshness
+   * window — used by a manual "refresh" so a just-arrived deposit shows without
+   * waiting for the TTL to lapse.
+   *
+   * @returns {Promise<void>}
+   */
+  async resync () {
+    return this._run(() => this._sync(true))
+  }
+
+  /**
+   * Serializes access to the underlying LWK `Wollet`. lwk's `Wollet` is NOT
+   * re-entrant: if a second operation borrows it (e.g. `fullScan`, `balance`,
+   * `utxos`) while the first is still awaiting, the wasm panics with
+   * "recursive use of an object detected which would lead to unsafe aliasing
+   * in rust". Consumers routinely fire balance + assets + address concurrently,
+   * so every public op that touches the Wollet runs through this FIFO queue.
+   *
+   * @private
+   * @template T
+   * @param {() => Promise<T>} op
+   * @returns {Promise<T>}
+   */
+  _run (op) {
+    const run = this._opChain.then(op, op)
+    // Keep the chain alive regardless of success/failure, and never leak the
+    // resolved value into the next op's argument.
+    this._opChain = run.then(() => undefined, () => undefined)
+    return run
   }
 
   /**
@@ -121,8 +224,10 @@ export class LiquidAccount {
    * @returns {Promise<string>}
    */
   async getAddress () {
-    this._ensureReady()
-    return this._wollet.address().address().toString()
+    return this._run(async () => {
+      this._ensureReady()
+      return this._wollet.address().address().toString()
+    })
   }
 
   /**
@@ -131,8 +236,10 @@ export class LiquidAccount {
    * @returns {Promise<bigint>}
    */
   async getBalance () {
-    await this._sync()
-    return this._balanceOf(this._network.policyAsset().toString())
+    return this._run(async () => {
+      await this._sync()
+      return this._balanceOf(this._network.policyAsset().toString())
+    })
   }
 
   /**
@@ -142,22 +249,36 @@ export class LiquidAccount {
    * @returns {Promise<bigint>}
    */
   async getTokenBalance (assetId) {
-    await this._sync()
-    return this._balanceOf(assetId)
+    return this._run(async () => {
+      await this._sync()
+      return this._balanceOf(assetId)
+    })
   }
 
   /**
    * Sends L-BTC on the Liquid network.
    *
+   * NB: `feeRate` is in **sat/kvB** (lwk convention; its default is 100, i.e.
+   * 0.1 sat/vB — the Liquid network minimum). Do NOT pass Bitcoin-style sat/vB
+   * values: 1 sat/vB must be given as 1000. When omitted, lwk's default is used,
+   * which is virtually always right on Liquid (federated 1-min blocks, no fee
+   * market).
+   *
    * @param {{ recipient: string, amount: number | bigint, feeRate?: number }} options
    * @returns {Promise<{ hash: string, fee: bigint }>}
    */
   async transfer ({ recipient, amount, feeRate }) {
-    await this._sync()
-    const builder = this._network.txBuilder()
-    builder.addLbtcRecipient(lwk.Address.parse(recipient, this._network), BigInt(amount))
-    if (feeRate != null) builder.feeRate(feeRate)
-    return this._buildSignBroadcast(builder)
+    return this._run(async () => {
+      await this._sync(true) // sends must build against fresh UTXOs
+      // lwk's TxBuilder is a CONSUMING builder (wasm-bindgen moves `self`):
+      // every chain method invalidates the receiver and returns a fresh
+      // builder. Reusing the old reference throws "null pointer passed to
+      // rust" — always reassign.
+      let builder = this._network.txBuilder()
+      builder = builder.addLbtcRecipient(lwk.Address.parse(recipient, this._network), BigInt(amount))
+      if (feeRate != null) builder = builder.feeRate(feeRate)
+      return this._buildSignBroadcast(builder)
+    })
   }
 
   /**
@@ -225,19 +346,24 @@ export class LiquidAccount {
   /**
    * Sends a non-L-BTC Liquid asset (e.g. USDt-Liquid).
    *
+   * NB: `feeRate` is in **sat/kvB** — see `transfer`.
+   *
    * @param {{ assetId: string, recipient: string, amount: number | bigint, feeRate?: number }} options
    * @returns {Promise<{ hash: string, fee: bigint }>}
    */
   async sendAsset ({ assetId, recipient, amount, feeRate }) {
-    await this._sync()
-    const builder = this._network.txBuilder()
-    builder.addRecipient(
-      lwk.Address.parse(recipient, this._network),
-      BigInt(amount),
-      lwk.AssetId.fromString(assetId)
-    )
-    if (feeRate != null) builder.feeRate(feeRate)
-    return this._buildSignBroadcast(builder)
+    return this._run(async () => {
+      await this._sync(true) // sends must build against fresh UTXOs
+      // Consuming builder — see `transfer`: reassign after every chain call.
+      let builder = this._network.txBuilder()
+      builder = builder.addRecipient(
+        lwk.Address.parse(recipient, this._network),
+        BigInt(amount),
+        lwk.AssetId.fromString(assetId)
+      )
+      if (feeRate != null) builder = builder.feeRate(feeRate)
+      return this._buildSignBroadcast(builder)
+    })
   }
 
   /**
@@ -262,11 +388,16 @@ export class LiquidAccount {
    * @returns {Promise<Array<{ asset_id: string, balance: string }>>}
    */
   async listAssets () {
-    await this._sync()
-    return this._wollet.balance().entries().map(([asset, value]) => ({
-      asset_id: asset,
-      balance: String(value)
-    }))
+    return this._run(async () => {
+      await this._sync()
+      // `Balance.entries()` is an iterable of [assetId, value] pairs, NOT a plain
+      // array (it has no `.map`), so materialize it with Array.from — works across
+      // the lwk_node / lwk_wasm / lwk-rn bindings.
+      return Array.from(this._wollet.balance().entries(), ([asset, value]) => ({
+        asset_id: String(asset),
+        balance: String(value)
+      }))
+    })
   }
 
   /**
@@ -275,34 +406,47 @@ export class LiquidAccount {
    * @returns {Promise<Array<{ txid: string, vout: number, asset_id: string, value: string, height: number | null }>>}
    */
   async listUnspents () {
-    await this._sync()
-    return this._wollet.utxos().map((u) => {
-      const outpoint = u.outpoint()
-      const secrets = u.unblinded()
-      return {
-        txid: outpoint.txid().toString(),
-        vout: outpoint.vout(),
-        asset_id: secrets.asset().toString(),
-        value: String(secrets.value()),
-        height: u.height() ?? null
-      }
+    return this._run(async () => {
+      await this._sync()
+      return this._wollet.utxos().map((u) => {
+        const outpoint = u.outpoint()
+        const secrets = u.unblinded()
+        return {
+          txid: outpoint.txid().toString(),
+          vout: outpoint.vout(),
+          asset_id: secrets.asset().toString(),
+          value: String(secrets.value()),
+          height: u.height() ?? null
+        }
+      })
     })
   }
 
   /**
    * Returns the wallet transaction history (newest first).
    *
-   * @returns {Promise<Array<{ txid: string, type: string, fee: string, height: number | null, timestamp: number | null }>>}
+   * `balance` carries the wallet's net delta per asset for the tx (positive =
+   * received, negative = sent), in each asset's smallest unit as a string, so
+   * consumers can render per-asset amounts without re-scanning the UTXO set.
+   *
+   * @returns {Promise<Array<{ txid: string, type: string, fee: string, height: number | null, timestamp: number | null, balance: Array<{ asset_id: string, value: string }> }>>}
    */
   async listTransactions () {
-    await this._sync()
-    return this._wollet.transactions().map((tx) => ({
-      txid: tx.txid().toString(),
-      type: tx.txType(),
-      fee: String(tx.fee()),
-      height: tx.height() ?? null,
-      timestamp: tx.timestamp() ?? null
-    }))
+    return this._run(async () => {
+      await this._sync()
+      return this._wollet.transactions().map((tx) => ({
+        txid: tx.txid().toString(),
+        type: tx.txType(),
+        fee: String(tx.fee()),
+        height: tx.height() ?? null,
+        timestamp: tx.timestamp() ?? null,
+        // See listAssets: entries() is an iterable, not an array — use Array.from.
+        balance: Array.from(tx.balance().entries(), ([asset, value]) => ({
+          asset_id: String(asset),
+          value: String(value)
+        }))
+      }))
+    })
   }
 
   /**
@@ -311,14 +455,21 @@ export class LiquidAccount {
    * @returns {Promise<{ network: string, policy_asset: string, address: string, tip_height: number | null }>}
    */
   async getNetworkInfo () {
-    await this._sync()
-    let tipHeight = null
-    try { tipHeight = this._wollet.tip().height() } catch { /* never scanned */ }
-    return {
-      network: this._network.toString(),
-      policy_asset: this._network.policyAsset().toString(),
-      address: this._wollet.address().address().toString(),
-      tip_height: tipHeight ?? null
-    }
+    // Status read — must be CHEAP. network/policy_asset/address need no chain
+    // data, and tip_height reports the last-applied scan tip (null before the
+    // first scan). Consumers poll this for connection status; making it scan
+    // would put an Esplora full-scan on every status check and wedge the op
+    // queue behind slow networks.
+    return this._run(async () => {
+      this._ensureReady()
+      let tipHeight = null
+      try { tipHeight = this._wollet.tip().height() } catch { /* never scanned */ }
+      return {
+        network: this._network.toString(),
+        policy_asset: this._network.policyAsset().toString(),
+        address: this._wollet.address().address().toString(),
+        tip_height: tipHeight ?? null
+      }
+    })
   }
 }
