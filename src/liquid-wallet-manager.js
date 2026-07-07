@@ -53,7 +53,8 @@ export default class LiquidWalletManager extends WalletManager {
     this._account = new LiquidAccount({
       mnemonic,
       network: config.network ?? 'testnet',
-      esploraUrl: config.esploraUrl
+      esploraUrl: config.esploraUrl,
+      scanTimeoutMs: config.scanTimeoutMs
     })
   }
 
