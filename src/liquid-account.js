@@ -295,12 +295,27 @@ export class LiquidAccount {
   async transfer ({ recipient, amount, feeRate }) {
     return this._run(async () => {
       await this._sync(true) // sends must build against fresh UTXOs
+      const address = lwk.Address.parse(recipient, this._network)
+      const requested = BigInt(amount)
       // lwk's TxBuilder is a CONSUMING builder (wasm-bindgen moves `self`):
       // every chain method invalidates the receiver and returns a fresh
       // builder. Reusing the old reference throws "null pointer passed to
       // rust" — always reassign.
       let builder = this._network.txBuilder()
-      builder = builder.addLbtcRecipient(lwk.Address.parse(recipient, this._network), BigInt(amount))
+      // Send-max: `addLbtcRecipient` adds the fee ON TOP of the amount, so
+      // requesting the entire L-BTC balance leaves nothing to cover the fee and
+      // lwk fails with "Insufficient funds: missing <fee> units for asset
+      // <L-BTC>". When the requested amount is the whole spendable balance,
+      // drain instead — it sends every L-BTC input to the recipient with the
+      // fee deducted from the amount. (You can never send more than the balance,
+      // so `>=` uniquely means "send all, net of fee".)
+      const policyBalance = this._balanceOf(this._network.policyAsset().toString())
+      if (requested >= policyBalance) {
+        builder = builder.drainLbtcWallet()
+        builder = builder.drainLbtcTo(address)
+      } else {
+        builder = builder.addLbtcRecipient(address, requested)
+      }
       if (feeRate != null) builder = builder.feeRate(feeRate)
       return this._buildSignBroadcast(builder)
     })
