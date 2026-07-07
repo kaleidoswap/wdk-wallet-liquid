@@ -261,6 +261,76 @@ describe('LiquidAccount', () => {
     account.dispose()
   })
 
+  test('waterfalls config is stored and defaults to off', () => {
+    const off = new LiquidAccount({ mnemonic: SEED })
+    expect(off._waterfalls).toBe(false)
+    expect(off._waterfallsRecipient).toBeNull()
+
+    const on = new LiquidAccount({
+      mnemonic: SEED,
+      esploraUrl: 'https://waterfalls.example/liquid/api',
+      waterfalls: true,
+      waterfallsRecipient: 'recipient-key'
+    })
+    expect(on._waterfalls).toBe(true)
+    expect(on._waterfallsRecipient).toBe('recipient-key')
+  })
+
+  test('LiquidWalletManager forwards waterfalls options to the account', async () => {
+    const wallet = new LiquidWalletManager(SEED, {
+      esploraUrl: 'https://waterfalls.example/liquidtestnet/api',
+      waterfalls: true,
+      waterfallsRecipient: 'rk'
+    })
+    const account = await wallet.getAccount(0)
+    expect(account._waterfalls).toBe(true)
+    expect(account._waterfallsRecipient).toBe('rk')
+    wallet.dispose()
+  })
+
+  test('the descriptor recipient key is applied to the scan client exactly once', async () => {
+    // In waterfalls mode with a recipient key, the descriptor must be encrypted
+    // before it is sent — setWaterfallsServerRecipient is applied lazily in _sync
+    // (it's async, so it can't live in the synchronous _ensureReady) and only once
+    // per client, not on every scan.
+    const account = new LiquidAccount({
+      mnemonic: SEED,
+      esploraUrl: 'https://waterfalls.example/liquid/api',
+      waterfalls: true,
+      waterfallsRecipient: 'recipient-key'
+    })
+    account._ensureReady()
+    let recipientCalls = 0
+    let scans = 0
+    account._esplora = {
+      setWaterfallsServerRecipient: async () => { recipientCalls++ },
+      fullScan: async () => { scans++; return null }
+    }
+
+    await account._sync(true)
+    account._lastSyncAt = 0 // force a second scan past the freshness window
+    await account._sync(true)
+
+    expect(scans).toBe(2)
+    expect(recipientCalls).toBe(1)
+    account.dispose()
+  })
+
+  test('no recipient key is set when waterfalls is off or the key is absent', async () => {
+    // Standard esplora mode (or waterfalls without a key) must never call the
+    // waterfalls-only recipient setter.
+    const account = new LiquidAccount({ mnemonic: SEED })
+    account._ensureReady()
+    let recipientCalls = 0
+    account._esplora = {
+      setWaterfallsServerRecipient: async () => { recipientCalls++ },
+      fullScan: async () => null
+    }
+    await account._sync(true)
+    expect(recipientCalls).toBe(0)
+    account.dispose()
+  })
+
   test('listAssets materializes a non-array (Map) Balance.entries()', async () => {
     // lwk's `Balance.entries()` is an *iterable* of [asset, value] pairs, not a
     // plain array — it has no `.map`. Regression guard: listAssets must use

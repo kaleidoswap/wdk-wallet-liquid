@@ -22,6 +22,10 @@ import { LiquidAccount } from './liquid-account.js'
  * @typedef {Object} LiquidWalletConfig
  * @property {'mainnet' | 'testnet' | 'regtest'} [network] - Liquid network (default: 'testnet').
  * @property {string} [esploraUrl] - Esplora API base URL (default: the network's built-in client).
+ * @property {boolean} [waterfalls] - Use the server-side waterfalls scan (single request) instead
+ *   of a client-side gap-limit scan. Requires `esploraUrl` to point at a waterfalls-capable server.
+ * @property {string} [waterfallsRecipient] - Optional waterfalls server recipient key; encrypts the
+ *   descriptor before it is sent. See LiquidAccountConfig.
  * @property {string} [mnemonic] - BIP-39 mnemonic; required only when the seed is passed as bytes.
  */
 
@@ -54,6 +58,8 @@ export default class LiquidWalletManager extends WalletManager {
       mnemonic,
       network: config.network ?? 'testnet',
       esploraUrl: config.esploraUrl,
+      waterfalls: config.waterfalls,
+      waterfallsRecipient: config.waterfallsRecipient,
       scanTimeoutMs: config.scanTimeoutMs
     })
   }

@@ -19,6 +19,18 @@ export interface LiquidWalletConfig {
   network?: LiquidNetworkName
   /** Esplora API base URL (default: the network's built-in client). */
   esploraUrl?: string
+  /**
+   * Use the server-side "waterfalls" scan (one request: descriptor → full history) instead of a
+   * client-side gap-limit scan (~40 requests). Turns a ~10s cold sync into sub-second, but requires
+   * `esploraUrl` to point at a waterfalls-capable server (public Blockstream Esplora is not one).
+   * Default: false.
+   */
+  waterfalls?: boolean
+  /**
+   * Optional waterfalls server recipient key; when set, the wallet descriptor is encrypted before it
+   * is sent to the server. Ignored unless `waterfalls` is true.
+   */
+  waterfallsRecipient?: string
   /** BIP-39 mnemonic; required only when the seed is passed as bytes. */
   mnemonic?: string
   /** Watchdog for a wedged Esplora full-scan, in ms (default: 30000). */
@@ -74,7 +86,7 @@ export interface LiquidNetworkInfo {
 }
 
 export class LiquidAccount {
-  constructor (config: { mnemonic: string, network?: LiquidNetworkName, esploraUrl?: string, scanTimeoutMs?: number })
+  constructor (config: { mnemonic: string, network?: LiquidNetworkName, esploraUrl?: string, waterfalls?: boolean, waterfallsRecipient?: string, scanTimeoutMs?: number })
 
   getAddress (): Promise<string>
   getBalance (): Promise<bigint>

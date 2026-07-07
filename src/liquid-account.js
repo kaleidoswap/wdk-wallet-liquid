@@ -27,6 +27,15 @@ import lwk from '#lwk'
  * @property {string} mnemonic - BIP-39 mnemonic phrase used to derive the signer.
  * @property {LiquidNetworkName} [network] - Liquid network (default: 'testnet').
  * @property {string} [esploraUrl] - Esplora API base URL (default: the network's built-in client).
+ * @property {boolean} [waterfalls] - Use the server-side "waterfalls" scan instead of a
+ *   client-side gap-limit scan. Collapses the ~40 per-scan Esplora requests into a single
+ *   request (descriptor → full history), turning a ~10s cold sync into sub-second — but it
+ *   requires `esploraUrl` to point at a waterfalls-capable server (e.g.
+ *   https://waterfalls.liquidwebwallet.org/liquid/api). Public Blockstream Esplora does NOT
+ *   expose the waterfalls endpoint. Default: false.
+ * @property {string} [waterfallsRecipient] - Optional waterfalls server recipient key. When
+ *   set, the wallet descriptor is encrypted before it is sent to the server (privacy: without
+ *   it the server sees every address the descriptor derives). Ignored unless `waterfalls`.
  * @property {number} [scanTimeoutMs] - Watchdog for a wedged Esplora full-scan (default: 30000).
  */
 
@@ -84,6 +93,11 @@ export class LiquidAccount {
     this._mnemonic = config.mnemonic
     this._networkName = config.network ?? 'testnet'
     this._esploraUrl = config.esploraUrl ?? null
+    this._waterfalls = config.waterfalls ?? false
+    this._waterfallsRecipient = config.waterfallsRecipient ?? null
+    // Whether setWaterfallsServerRecipient() has been applied to the CURRENT
+    // EsploraClient. Reset whenever the client is rebuilt (see _ensureReady).
+    this._waterfallsRecipientApplied = false
     this._scanTimeoutMs = config.scanTimeoutMs ?? DEFAULT_SCAN_TIMEOUT_MS
     this._ready = false
     // FIFO queue serializing every op that borrows the LWK Wollet (see `_run`).
@@ -105,12 +119,15 @@ export class LiquidAccount {
     this._signer = new lwk.Signer(new lwk.Mnemonic(this._mnemonic), this._network)
     this._descriptor = this._signer.wpkhSlip77Descriptor()
     this._wollet = new lwk.Wollet(this._network, this._descriptor)
-    // EsploraClient(network, url, waterfalls, concurrency, utxo_only). A
-    // gap-limit full-scan issues ~40+ requests; concurrency 1 serializes them
-    // into a 10s+ scan, so use 4 to keep the first scan responsive.
+    // EsploraClient(network, url, waterfalls, concurrency, utxo_only). With
+    // waterfalls=false a gap-limit full-scan issues ~40+ requests, so use
+    // concurrency 4 to keep it responsive. With waterfalls=true the server
+    // returns the whole history in ONE request, so concurrency is moot.
     this._esplora = this._esploraUrl
-      ? new lwk.EsploraClient(this._network, this._esploraUrl, false, 4, false)
+      ? new lwk.EsploraClient(this._network, this._esploraUrl, this._waterfalls, 4, false)
       : this._network.defaultEsploraClient()
+    // Fresh client → the recipient key (if any) must be (re)applied before use.
+    this._waterfallsRecipientApplied = false
 
     this._ready = true
   }
@@ -136,8 +153,16 @@ export class LiquidAccount {
     this._ensureReady()
     const freshness = force ? FORCE_SYNC_TTL_MS : SYNC_TTL_MS
     if (this._lastSyncAt && (Date.now() - this._lastSyncAt) < freshness) return
+    // Encrypt the descriptor sent to the waterfalls server, once per client.
+    // Only applies in waterfalls mode; setWaterfallsServerRecipient is async so
+    // it can't live in the synchronous _ensureReady.
+    if (this._waterfalls && this._waterfallsRecipient && !this._waterfallsRecipientApplied) {
+      await this._esplora.setWaterfallsServerRecipient(this._waterfallsRecipient)
+      this._waterfallsRecipientApplied = true
+    }
     const t0 = Date.now()
-    console.info(`[LiquidAccount] fullScan start (${this._networkName}, ${this._esploraUrl ?? 'default esplora'})`)
+    const scanKind = this._waterfalls ? 'waterfalls scan' : 'fullScan'
+    console.info(`[LiquidAccount] ${scanKind} start (${this._networkName}, ${this._esploraUrl ?? 'default esplora'})`)
     let timer
     try {
       const timeout = new Promise((_resolve, reject) => {
@@ -149,9 +174,9 @@ export class LiquidAccount {
       const update = await Promise.race([this._esplora.fullScan(this._wollet), timeout])
       if (update) this._wollet.applyUpdate(update)
       this._lastSyncAt = Date.now()
-      console.info(`[LiquidAccount] fullScan done in ${Date.now() - t0}ms`)
+      console.info(`[LiquidAccount] ${scanKind} done in ${Date.now() - t0}ms`)
     } catch (err) {
-      console.error(`[LiquidAccount] fullScan FAILED after ${Date.now() - t0}ms:`, err?.message ?? err)
+      console.error(`[LiquidAccount] ${scanKind} FAILED after ${Date.now() - t0}ms:`, err?.message ?? err)
       if (/timed out/.test(String(err?.message ?? ''))) {
         // The wedged scan may still hold the &mut Wollet borrow inside wasm, so
         // none of the current objects are safe to touch again. Orphan the whole
