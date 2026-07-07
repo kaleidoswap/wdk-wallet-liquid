@@ -1,6 +1,6 @@
 {
   "name": "@kaleidorg/wdk-wallet-liquid",
-  "version": "1.0.0-beta.3",
+  "version": "1.0.0-beta.4",
   "description": "WDK wallet adapter for the Liquid network — wraps an in-process LWK (Liquid Wallet Kit) wallet in the WDK account model.",
   "keywords": [
     "wdk",
