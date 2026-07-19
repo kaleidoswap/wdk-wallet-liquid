@@ -490,6 +490,35 @@ describe('LiquidAccount', () => {
     account.dispose()
   })
 
+  test('requires an explicit URL when Waterfalls is enabled', () => {
+    expect(() => new LiquidAccount({
+      mnemonic: SEED,
+      waterfalls: true
+    })).toThrow('LiquidAccount: waterfalls requires config.esploraUrl')
+  })
+
+  test('does not treat truthy non-boolean values as fallback consent', async () => {
+    const account = new LiquidAccount({
+      mnemonic: SEED,
+      esploraUrl: 'https://waterfalls.example/liquid/api',
+      waterfalls: true,
+      allowDefaultEsploraFallback: 'false'
+    })
+    account._ensureReady()
+    const waterfallsError = new Error('waterfalls unavailable')
+    account._esplora = { fullScan: async () => { throw waterfallsError } }
+    let fallbackClients = 0
+    account._network.defaultEsploraClient = () => {
+      fallbackClients++
+      return { fullScan: async () => null }
+    }
+
+    await expect(account._sync(true)).rejects.toBe(waterfallsError)
+    expect(fallbackClients).toBe(0)
+    expect(account._waterfalls).toBe(true)
+    account.dispose()
+  })
+
   test('does not change providers unless default-Esplora fallback is explicitly allowed', async () => {
     const account = new LiquidAccount({
       mnemonic: SEED,

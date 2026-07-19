@@ -98,8 +98,11 @@ export class LiquidAccount {
     this._mnemonic = config.mnemonic
     this._networkName = config.network ?? 'testnet'
     this._esploraUrl = config.esploraUrl ?? null
-    this._waterfalls = config.waterfalls ?? false
-    this._allowDefaultEsploraFallback = config.allowDefaultEsploraFallback ?? false
+    this._waterfalls = config.waterfalls === true
+    this._allowDefaultEsploraFallback = config.allowDefaultEsploraFallback === true
+    if (this._waterfalls && !this._esploraUrl) {
+      throw new Error('LiquidAccount: waterfalls requires config.esploraUrl')
+    }
     this._waterfallsRecipient = config.waterfallsRecipient ?? null
     this._onWarning = typeof config.onWarning === 'function' ? config.onWarning : null
     // Whether setWaterfallsServerRecipient() has been applied to the CURRENT
