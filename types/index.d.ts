@@ -14,6 +14,12 @@
 
 export type LiquidNetworkName = 'mainnet' | 'testnet' | 'regtest'
 
+export interface LiquidSyncWarning {
+  code: 'LIQUID_WATERFALLS_FALLBACK'
+  message: string
+  details?: { reason?: 'waterfalls_failed' }
+}
+
 export interface LiquidWalletConfig {
   /** Liquid network (default: 'testnet'). */
   network?: LiquidNetworkName
@@ -27,12 +33,20 @@ export interface LiquidWalletConfig {
    */
   waterfalls?: boolean
   /**
+   * Explicitly allow Waterfalls failures to retry once through the network's built-in standard
+   * Esplora provider. This changes providers and may disclose wallet addresses/scripts to it.
+   * Default: false.
+   */
+  allowDefaultEsploraFallback?: boolean
+  /**
    * Optional waterfalls server recipient key; when set, the wallet descriptor is encrypted before it
    * is sent to the server. Ignored unless `waterfalls` is true.
    */
   waterfallsRecipient?: string
   /** BIP-39 mnemonic; required only when the seed is passed as bytes. */
   mnemonic?: string
+  /** Receives a recoverable warning after Waterfalls fails and standard Esplora succeeds. */
+  onWarning?: (warning: LiquidSyncWarning) => void | Promise<void>
   /** Watchdog for a wedged Esplora full-scan, in ms (default: 30000). */
   scanTimeoutMs?: number
 }
@@ -86,7 +100,7 @@ export interface LiquidNetworkInfo {
 }
 
 export class LiquidAccount {
-  constructor (config: { mnemonic: string, network?: LiquidNetworkName, esploraUrl?: string, waterfalls?: boolean, waterfallsRecipient?: string, scanTimeoutMs?: number })
+  constructor (config: LiquidWalletConfig & { mnemonic: string })
 
   getAddress (): Promise<string>
   getBalance (): Promise<bigint>
@@ -101,6 +115,7 @@ export class LiquidAccount {
   listUnspents (): Promise<LiquidUnspent[]>
   listTransactions (): Promise<LiquidTransaction[]>
   getNetworkInfo (): Promise<LiquidNetworkInfo>
+  resync (): Promise<void>
 }
 
 export default class LiquidWalletManager {
