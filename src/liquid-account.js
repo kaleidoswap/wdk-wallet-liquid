@@ -33,9 +33,14 @@ import lwk from '#lwk'
  *   requires `esploraUrl` to point at a waterfalls-capable server (e.g.
  *   https://waterfalls.liquidwebwallet.org/liquid/api). Public Blockstream Esplora does NOT
  *   expose the waterfalls endpoint. Default: false.
+ * @property {boolean} [allowDefaultEsploraFallback] - Explicitly allow Waterfalls failures to
+ *   retry once through the network's built-in standard Esplora provider. This changes providers
+ *   and may disclose wallet addresses/scripts to that provider. Default: false.
  * @property {string} [waterfallsRecipient] - Optional waterfalls server recipient key. When
- *   set, the wallet descriptor is encrypted before it is sent to the server (privacy: without
- *   it the server sees every address the descriptor derives). Ignored unless `waterfalls`.
+ *   set, encrypts the descriptor before sending it to the server (without encryption,
+ *   the server sees every address the descriptor derives). Ignored unless `waterfalls`.
+ * @property {(warning: {code: string, message: string, details?: object}) => (void | Promise<void>)} [onWarning]
+ *   Called when Waterfalls fails and the account recovers with standard Esplora.
  * @property {number} [scanTimeoutMs] - Watchdog for a wedged Esplora full-scan (default: 30000).
  */
 
@@ -94,7 +99,9 @@ export class LiquidAccount {
     this._networkName = config.network ?? 'testnet'
     this._esploraUrl = config.esploraUrl ?? null
     this._waterfalls = config.waterfalls ?? false
+    this._allowDefaultEsploraFallback = config.allowDefaultEsploraFallback ?? false
     this._waterfallsRecipient = config.waterfallsRecipient ?? null
+    this._onWarning = typeof config.onWarning === 'function' ? config.onWarning : null
     // Whether setWaterfallsServerRecipient() has been applied to the CURRENT
     // EsploraClient. Reset whenever the client is rebuilt (see _ensureReady).
     this._waterfallsRecipientApplied = false
@@ -153,18 +160,18 @@ export class LiquidAccount {
     this._ensureReady()
     const freshness = force ? FORCE_SYNC_TTL_MS : SYNC_TTL_MS
     if (this._lastSyncAt && (Date.now() - this._lastSyncAt) < freshness) return
-    // Encrypt the descriptor sent to the waterfalls server, once per client.
-    // Only applies in waterfalls mode; setWaterfallsServerRecipient is async so
-    // it can't live in the synchronous _ensureReady.
-    if (this._waterfalls && this._waterfallsRecipient && !this._waterfallsRecipientApplied) {
-      await this._esplora.setWaterfallsServerRecipient(this._waterfallsRecipient)
-      this._waterfallsRecipientApplied = true
-    }
     const t0 = Date.now()
     const scanKind = this._waterfalls ? 'waterfalls scan' : 'fullScan'
     console.info(`[LiquidAccount] ${scanKind} start (${this._networkName}, ${this._esploraUrl ?? 'default esplora'})`)
     let timer
     try {
+      // Encrypt the descriptor sent to the waterfalls server, once per client.
+      // Keep setup in the guarded attempt: recipient setup is part of Waterfalls,
+      // so a setup failure must take the same standard-Esplora fallback path.
+      if (this._waterfalls && this._waterfallsRecipient && !this._waterfallsRecipientApplied) {
+        await this._esplora.setWaterfallsServerRecipient(this._waterfallsRecipient)
+        this._waterfallsRecipientApplied = true
+      }
       const timeout = new Promise((_resolve, reject) => {
         timer = setTimeout(
           () => reject(new Error(`LiquidAccount: fullScan timed out after ${this._scanTimeoutMs}ms`)),
@@ -176,15 +183,52 @@ export class LiquidAccount {
       this._lastSyncAt = Date.now()
       console.info(`[LiquidAccount] ${scanKind} done in ${Date.now() - t0}ms`)
     } catch (err) {
-      console.error(`[LiquidAccount] ${scanKind} FAILED after ${Date.now() - t0}ms:`, err?.message ?? err)
-      if (/timed out/.test(String(err?.message ?? ''))) {
+      console.error(`[LiquidAccount] ${scanKind} FAILED after ${Date.now() - t0}ms`)
+      const timedOut = /timed out/.test(String(err?.message ?? ''))
+      if (timedOut) {
         // The wedged scan may still hold the &mut Wollet borrow inside wasm, so
         // none of the current objects are safe to touch again. Orphan the whole
-        // graph — the next op's `_ensureReady()` rebuilds fresh objects, and the
-        // zombie scan finishes (or dies) against the orphan without conflict.
+        // graph — the fallback below (or the next op) rebuilds fresh objects, and
+        // the zombie scan finishes (or dies) against the orphan without conflict.
         // Deliberately no free()/dispose() here: freeing a borrowed wasm object
         // would abort; leaking it is harmless.
         this._ready = false
+      }
+      if (this._waterfalls && this._allowDefaultEsploraFallback) {
+        const warning = {
+          code: 'LIQUID_WATERFALLS_FALLBACK',
+          message: 'Liquid Waterfalls failed; using standard Esplora fallback.',
+          details: { reason: 'waterfalls_failed' }
+        }
+        this._waterfalls = false
+        this._waterfallsRecipient = null
+        this._waterfallsRecipientApplied = false
+        this._esploraUrl = null
+        this._lastSyncAt = 0
+        try {
+          if (this._ready) this._esplora = this._network.defaultEsploraClient()
+          await this._sync(force)
+        } catch (fallbackErr) {
+          // Never leave the old Waterfalls client reachable after a failed
+          // provider transition. The next operation must rebuild a fresh
+          // standard-Esplora graph.
+          this._ready = false
+          throw new AggregateError(
+            [err, fallbackErr],
+            'Liquid Waterfalls failed; standard Esplora fallback failed'
+          )
+        }
+        try {
+          const callbackResult = this._onWarning?.(warning)
+          if (callbackResult && typeof callbackResult.then === 'function') {
+            callbackResult.catch(() => {
+              console.warn('[LiquidAccount] onWarning callback failed')
+            })
+          }
+        } catch {
+          console.warn('[LiquidAccount] onWarning callback failed')
+        }
+        return
       }
       throw err
     } finally {

@@ -271,28 +271,265 @@ describe('LiquidAccount', () => {
   test('waterfalls config is stored and defaults to off', () => {
     const off = new LiquidAccount({ mnemonic: SEED })
     expect(off._waterfalls).toBe(false)
+    expect(off._allowDefaultEsploraFallback).toBe(false)
     expect(off._waterfallsRecipient).toBeNull()
 
     const on = new LiquidAccount({
       mnemonic: SEED,
       esploraUrl: 'https://waterfalls.example/liquid/api',
       waterfalls: true,
+      allowDefaultEsploraFallback: true,
       waterfallsRecipient: 'recipient-key'
     })
     expect(on._waterfalls).toBe(true)
+    expect(on._allowDefaultEsploraFallback).toBe(true)
     expect(on._waterfallsRecipient).toBe('recipient-key')
   })
 
   test('LiquidWalletManager forwards waterfalls options to the account', async () => {
+    const onWarning = () => {}
     const wallet = new LiquidWalletManager(SEED, {
       esploraUrl: 'https://waterfalls.example/liquidtestnet/api',
       waterfalls: true,
-      waterfallsRecipient: 'rk'
+      allowDefaultEsploraFallback: true,
+      waterfallsRecipient: 'rk',
+      onWarning
     })
     const account = await wallet.getAccount(0)
     expect(account._waterfalls).toBe(true)
+    expect(account._allowDefaultEsploraFallback).toBe(true)
     expect(account._waterfallsRecipient).toBe('rk')
+    expect(account._onWarning).toBe(onWarning)
     wallet.dispose()
+  })
+
+  test('falls back to the default Esplora scan and emits a recoverable warning when Waterfalls fails', async () => {
+    const warnings = []
+    const account = new LiquidAccount({
+      mnemonic: SEED,
+      esploraUrl: 'https://waterfalls.example/liquid/api',
+      waterfalls: true,
+      allowDefaultEsploraFallback: true,
+      onWarning: warning => warnings.push(warning)
+    })
+    account._ensureReady()
+
+    let waterfallsScans = 0
+    let fallbackScans = 0
+    const waterfallsClient = {
+      fullScan: async () => {
+        waterfallsScans++
+        throw new Error('waterfalls unavailable')
+      }
+    }
+    const fallbackClient = {
+      fullScan: async () => {
+        fallbackScans++
+        return null
+      }
+    }
+    account._esplora = waterfallsClient
+    account._network.defaultEsploraClient = () => fallbackClient
+
+    await expect(account._sync(true)).resolves.toBeUndefined()
+
+    expect(waterfallsScans).toBe(1)
+    expect(fallbackScans).toBe(1)
+    expect(account._waterfalls).toBe(false)
+    expect(account._esploraUrl).toBeNull()
+    expect(warnings).toEqual([{
+      code: 'LIQUID_WATERFALLS_FALLBACK',
+      message: 'Liquid Waterfalls failed; using standard Esplora fallback.',
+      details: { reason: 'waterfalls_failed' }
+    }])
+    account.dispose()
+  })
+
+  test('falls back when Waterfalls recipient setup fails before scanning', async () => {
+    const warnings = []
+    const account = new LiquidAccount({
+      mnemonic: SEED,
+      esploraUrl: 'https://waterfalls.example/liquid/api',
+      waterfalls: true,
+      allowDefaultEsploraFallback: true,
+      waterfallsRecipient: 'recipient-key',
+      onWarning: warning => warnings.push(warning)
+    })
+    account._ensureReady()
+
+    let fallbackScans = 0
+    account._esplora = {
+      setWaterfallsServerRecipient: async () => { throw new Error('recipient setup unavailable') },
+      fullScan: async () => { throw new Error('must not scan Waterfalls after setup failure') }
+    }
+    account._network.defaultEsploraClient = () => ({
+      fullScan: async () => { fallbackScans++; return null }
+    })
+
+    await expect(account._sync(true)).resolves.toBeUndefined()
+    expect(fallbackScans).toBe(1)
+    expect(warnings).toEqual([expect.objectContaining({
+      code: 'LIQUID_WATERFALLS_FALLBACK',
+      details: { reason: 'waterfalls_failed' }
+    })])
+    account.dispose()
+  })
+
+  test('rebuilds after a Waterfalls timeout and falls back exactly once', async () => {
+    const warnings = []
+    const account = new LiquidAccount({
+      mnemonic: SEED,
+      esploraUrl: 'https://waterfalls.example/liquid/api',
+      waterfalls: true,
+      allowDefaultEsploraFallback: true,
+      scanTimeoutMs: 20,
+      onWarning: warning => warnings.push(warning)
+    })
+    account._ensureReady()
+
+    let waterfallsScans = 0
+    let fallbackScans = 0
+    const fallbackClient = {
+      fullScan: async () => { fallbackScans++; return null }
+    }
+    account._esplora = {
+      fullScan: async () => {
+        waterfallsScans++
+        return new Promise(() => {})
+      }
+    }
+    const originalEnsureReady = account._ensureReady.bind(account)
+    account._ensureReady = function () {
+      if (this._ready) return
+      this._ready = true
+      this._network = { defaultEsploraClient: () => fallbackClient }
+      this._esplora = fallbackClient
+      this._wollet = { applyUpdate: () => {} }
+    }
+
+    await expect(account._sync(true)).resolves.toBeUndefined()
+    expect(waterfallsScans).toBe(1)
+    expect(fallbackScans).toBe(1)
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0].code).toBe('LIQUID_WATERFALLS_FALLBACK')
+    account._ensureReady = originalEnsureReady
+  })
+
+  test('reports both failures and does not emit a recovery warning when the Esplora fallback also fails', async () => {
+    const warnings = []
+    const account = new LiquidAccount({
+      mnemonic: SEED,
+      esploraUrl: 'https://waterfalls.example/liquid/api',
+      waterfalls: true,
+      allowDefaultEsploraFallback: true,
+      onWarning: warning => warnings.push(warning)
+    })
+    account._ensureReady()
+
+    const waterfallsError = new Error('waterfalls unavailable')
+    const fallbackError = new Error('fallback unavailable')
+    account._esplora = {
+      fullScan: async () => { throw waterfallsError }
+    }
+    account._network.defaultEsploraClient = () => ({
+      fullScan: async () => { throw fallbackError }
+    })
+
+    let thrown
+    try {
+      await account._sync(true)
+    } catch (error) {
+      thrown = error
+    }
+    expect(thrown).toBeInstanceOf(AggregateError)
+    expect(thrown.message).toBe(
+      'Liquid Waterfalls failed; standard Esplora fallback failed'
+    )
+    expect(thrown.errors).toEqual([waterfallsError, fallbackError])
+    expect(warnings).toEqual([])
+    account.dispose()
+  })
+
+  test('preserves the Waterfalls failure when constructing the fallback client also fails', async () => {
+    const account = new LiquidAccount({
+      mnemonic: SEED,
+      esploraUrl: 'https://waterfalls.example/liquid/api',
+      waterfalls: true,
+      allowDefaultEsploraFallback: true
+    })
+    account._ensureReady()
+
+    const waterfallsError = new Error('waterfalls unavailable')
+    const fallbackError = new Error('cannot construct default client')
+    account._esplora = {
+      fullScan: async () => { throw waterfallsError }
+    }
+    account._network.defaultEsploraClient = () => { throw fallbackError }
+
+    let thrown
+    try {
+      await account._sync(true)
+    } catch (error) {
+      thrown = error
+    }
+    expect(thrown).toBeInstanceOf(AggregateError)
+    expect(thrown.errors).toEqual([waterfallsError, fallbackError])
+
+    // A failed transition must invalidate the original Waterfalls client. The
+    // next attempt rebuilds a standard client instead of scanning it again.
+    expect(account._ready).toBe(false)
+    let fallbackScans = 0
+    account._ensureReady = function () {
+      if (this._ready) return
+      this._ready = true
+      this._esplora = { fullScan: async () => { fallbackScans++; return null } }
+      this._wollet = { applyUpdate: () => {} }
+    }
+    await expect(account._sync(true)).resolves.toBeUndefined()
+    expect(fallbackScans).toBe(1)
+    account.dispose()
+  })
+
+  test('does not change providers unless default-Esplora fallback is explicitly allowed', async () => {
+    const account = new LiquidAccount({
+      mnemonic: SEED,
+      esploraUrl: 'https://waterfalls.example/liquid/api',
+      waterfalls: true
+    })
+    account._ensureReady()
+    const waterfallsError = new Error('waterfalls unavailable')
+    account._esplora = { fullScan: async () => { throw waterfallsError } }
+    let fallbackClients = 0
+    account._network.defaultEsploraClient = () => {
+      fallbackClients++
+      return { fullScan: async () => null }
+    }
+
+    await expect(account._sync(true)).rejects.toBe(waterfallsError)
+    expect(fallbackClients).toBe(0)
+    expect(account._waterfalls).toBe(true)
+    account.dispose()
+  })
+
+  test.each([
+    ['synchronous throw', () => { throw new Error('sync callback failure') }],
+    ['rejected promise', async () => { throw new Error('async callback failure') }]
+  ])('warning callback %s does not disrupt a recovered sync', async (_label, onWarning) => {
+    const account = new LiquidAccount({
+      mnemonic: SEED,
+      esploraUrl: 'https://waterfalls.example/liquid/api',
+      waterfalls: true,
+      allowDefaultEsploraFallback: true,
+      onWarning
+    })
+    account._ensureReady()
+    account._esplora = { fullScan: async () => { throw new Error('waterfalls unavailable') } }
+    account._network.defaultEsploraClient = () => ({ fullScan: async () => null })
+
+    await expect(account._sync(true)).resolves.toBeUndefined()
+    // Let a rejected callback Promise reach its attached catch handler.
+    await Promise.resolve()
+    account.dispose()
   })
 
   test('the descriptor recipient key is applied to the scan client exactly once', async () => {

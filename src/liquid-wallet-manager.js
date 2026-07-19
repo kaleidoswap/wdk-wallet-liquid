@@ -24,8 +24,12 @@ import { LiquidAccount } from './liquid-account.js'
  * @property {string} [esploraUrl] - Esplora API base URL (default: the network's built-in client).
  * @property {boolean} [waterfalls] - Use the server-side waterfalls scan (single request) instead
  *   of a client-side gap-limit scan. Requires `esploraUrl` to point at a waterfalls-capable server.
+ * @property {boolean} [allowDefaultEsploraFallback] - Explicitly allow a one-time retry through
+ *   the network's built-in standard Esplora provider when Waterfalls fails. Default: false.
  * @property {string} [waterfallsRecipient] - Optional waterfalls server recipient key; encrypts the
  *   descriptor before it is sent. See LiquidAccountConfig.
+ * @property {(warning: {code: string, message: string, details?: object}) => (void | Promise<void>)} [onWarning]
+ *   Called when Waterfalls fails and the account recovers with standard Esplora.
  * @property {string} [mnemonic] - BIP-39 mnemonic; required only when the seed is passed as bytes.
  */
 
@@ -59,7 +63,9 @@ export default class LiquidWalletManager extends WalletManager {
       network: config.network ?? 'testnet',
       esploraUrl: config.esploraUrl,
       waterfalls: config.waterfalls,
+      allowDefaultEsploraFallback: config.allowDefaultEsploraFallback,
       waterfallsRecipient: config.waterfallsRecipient,
+      onWarning: config.onWarning,
       scanTimeoutMs: config.scanTimeoutMs
     })
   }
