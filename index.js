@@ -16,3 +16,4 @@
 
 export { default } from './src/liquid-wallet-manager.js'
 export { LiquidAccount } from './src/liquid-account.js'
+export { SimplicityUnavailableError } from './src/simplicity.js'

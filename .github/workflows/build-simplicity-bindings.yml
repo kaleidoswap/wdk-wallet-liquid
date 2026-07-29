@@ -1,0 +1,34 @@
+name: Build Simplicity LWK bindings
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - simplicity-bindings.json
+      - scripts/build-lwk-simplicity.mjs
+      - .github/workflows/build-simplicity-bindings.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.85.0'
+          targets: wasm32-unknown-unknown
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.13.1
+      - run: npm run build:lwk-simplicity
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lwk-wasm-simplicity
+          path: artifacts/lwk_wasm_simplicity
+          if-no-files-found: error

@@ -99,6 +99,59 @@ export interface LiquidNetworkInfo {
   tip_height: number | null
 }
 
+export type SimplicityArgument =
+  | { name: string; type: 'u8' | 'u16' | 'u32'; value: number }
+  | { name: string; type: 'u64'; value: string | number | bigint }
+  | { name: string; type: 'u128' | 'u256' | 'bytes'; value: string }
+  | { name: string; type: 'bool'; value: boolean }
+
+export interface SimplicityCapabilities {
+  version: 'experimental-0.1'
+  available: boolean
+  pset: { inspect: boolean; blind: boolean; sign: boolean; finalize: boolean }
+  simplicity: { compile: boolean; derivePublicKey: boolean; finalizeTransaction: boolean }
+}
+
+export interface LiquidPsetReview {
+  pset: string
+  uniqueId: string
+  inputCount: number
+  outputCount: number
+  inputs: Array<{ index: number; txid: string; vout: number; sighash: number; issuanceAsset?: string; issuanceToken?: string }>
+  outputs: Array<{ index: number; scriptPubKey: string; amount?: string; assetId?: string; blinderIndex?: number }>
+  fee: string
+  balances: Array<{ assetId: string; amount: string }>
+  recipients: Array<{ vout: number; address?: string; assetId?: string; amount?: string }>
+  issuances: Array<{
+    inputIndex: number
+    type: 'issuance' | 'reissuance' | 'none'
+    assetId?: string
+    tokenId?: string
+    previousTxid?: string
+    previousVout?: number
+  }>
+  signatures: Array<{ inputIndex: number; present: number; missing: number }>
+}
+
+export interface LiquidPsetSignResult {
+  pset: string
+  signedInputIndexes: number[]
+  unchanged: boolean
+}
+
+export interface SimplicityCompileResult {
+  cmr: string
+  address: string
+  internalKey: string
+  walletPublicKey: string
+  derivationPath: string
+}
+
+export class SimplicityUnavailableError extends Error {
+  readonly code: 'SIMPLICITY_UNAVAILABLE'
+  readonly feature: string
+}
+
 export class LiquidAccount {
   constructor (config: LiquidWalletConfig & { mnemonic: string })
 
@@ -107,6 +160,19 @@ export class LiquidAccount {
   getTokenBalance (assetId: string): Promise<bigint>
   transfer (options: { recipient: string, amount: number | bigint, feeRate?: number }): Promise<TransferResult>
   sign (message: string): Promise<string>
+  getSimplicityCapabilities (): SimplicityCapabilities
+  inspectPset (psetBase64: string): Promise<LiquidPsetReview>
+  blindPset (psetBase64: string): Promise<string>
+  signPset (request: { pset: string; inputIndexes?: number[] }): Promise<LiquidPsetSignResult>
+  finalizePset (psetBase64: string): Promise<{ pset: string; transactionHex: string; txid: string }>
+  broadcastPset (psetBase64: string): Promise<{ txid: string }>
+  deriveSimplicityPublicKey (derivationPath?: string): Promise<{ publicKey: string; derivationPath: string }>
+  compileSimplicityProgram (request: {
+    source: string
+    arguments?: SimplicityArgument[]
+    internalKey?: string
+    derivationPath?: string
+  }): Promise<SimplicityCompileResult>
   dispose (): void
   get keyPair (): KeyPair
 

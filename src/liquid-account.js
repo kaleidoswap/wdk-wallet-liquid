@@ -17,6 +17,13 @@
 // Resolved to the Node binding (`lwk_node`) or the browser binding (`lwk_wasm`)
 // at build time via the package's `imports` map — see package.json `#lwk`.
 import lwk from '#lwk'
+import {
+  SIMPLICITY_NUMS_INTERNAL_KEY,
+  buildSimplicityArguments,
+  getBindingCapabilities,
+  requireBindingFeature,
+  signatureCount
+} from './simplicity.js'
 
 /**
  * @typedef {'mainnet' | 'testnet' | 'regtest'} LiquidNetworkName
@@ -44,12 +51,12 @@ import lwk from '#lwk'
  * @property {number} [scanTimeoutMs] - Watchdog for a wedged Esplora full-scan (default: 30000).
  */
 
-function buildNetwork (name) {
+function buildNetwork (binding, name) {
   switch (name) {
-    case 'mainnet': return lwk.Network.mainnet()
-    case 'regtest': return lwk.Network.regtestDefault()
+    case 'mainnet': return binding.Network.mainnet()
+    case 'regtest': return binding.Network.regtestDefault()
     case 'testnet':
-    default: return lwk.Network.testnet()
+    default: return binding.Network.testnet()
   }
 }
 
@@ -96,6 +103,9 @@ export class LiquidAccount {
       throw new Error('LiquidAccount: config.mnemonic is required')
     }
     this._mnemonic = config.mnemonic
+    // Private test/host injection point. Production callers use the binding
+    // selected by the package import conditions.
+    this._lwk = config.bindings ?? lwk
     this._networkName = config.network ?? 'testnet'
     this._esploraUrl = config.esploraUrl ?? null
     this._waterfalls = config.waterfalls === true
@@ -125,16 +135,16 @@ export class LiquidAccount {
   _ensureReady () {
     if (this._ready) return
 
-    this._network = buildNetwork(this._networkName)
-    this._signer = new lwk.Signer(new lwk.Mnemonic(this._mnemonic), this._network)
+    this._network = buildNetwork(this._lwk, this._networkName)
+    this._signer = new this._lwk.Signer(new this._lwk.Mnemonic(this._mnemonic), this._network)
     this._descriptor = this._signer.wpkhSlip77Descriptor()
-    this._wollet = new lwk.Wollet(this._network, this._descriptor)
+    this._wollet = new this._lwk.Wollet(this._network, this._descriptor)
     // EsploraClient(network, url, waterfalls, concurrency, utxo_only). With
     // waterfalls=false a gap-limit full-scan issues ~40+ requests, so use
     // concurrency 4 to keep it responsive. With waterfalls=true the server
     // returns the whole history in ONE request, so concurrency is moot.
     this._esplora = this._esploraUrl
-      ? new lwk.EsploraClient(this._network, this._esploraUrl, this._waterfalls, 4, false)
+      ? new this._lwk.EsploraClient(this._network, this._esploraUrl, this._waterfalls, 4, false)
       : this._network.defaultEsploraClient()
     // Fresh client → the recipient key (if any) must be (re)applied before use.
     this._waterfallsRecipientApplied = false
@@ -342,7 +352,7 @@ export class LiquidAccount {
   async transfer ({ recipient, amount, feeRate }) {
     return this._run(async () => {
       await this._sync(true) // sends must build against fresh UTXOs
-      const address = lwk.Address.parse(recipient, this._network)
+      const address = this._lwk.Address.parse(recipient, this._network)
       const requested = BigInt(amount)
       // lwk's TxBuilder is a CONSUMING builder (wasm-bindgen moves `self`):
       // every chain method invalidates the receiver and returns a fresh
@@ -388,6 +398,202 @@ export class LiquidAccount {
   }
 
   /**
+   * Reports the exact experimental operations exposed by the active LWK
+   * binding. A normal npm build remains usable for ordinary Liquid PSETs but
+   * reports Simplicity compilation and external-PSET blinding as unavailable.
+   */
+  getSimplicityCapabilities () {
+    return getBindingCapabilities(this._lwk)
+  }
+
+  /** @private */
+  _inspectPsetObject (pset) {
+    const inputs = pset.inputs()
+    const outputs = pset.outputs()
+    const details = this._wollet.psetDetails(pset)
+    const balance = details.balance()
+    const signatures = details.signatures()
+
+    return {
+      pset: pset.toString(),
+      uniqueId: pset.uniqueId().toString(),
+      inputCount: inputs.length,
+      outputCount: outputs.length,
+      inputs: inputs.map((input, index) => ({
+        index,
+        txid: input.previousTxid().toString(),
+        vout: input.previousVout(),
+        sighash: input.sighash(),
+        issuanceAsset: input.issuanceAsset()?.toString(),
+        issuanceToken: input.issuanceToken()?.toString()
+      })),
+      outputs: outputs.map((output, index) => {
+        const amount = output.amount()
+        return {
+          index,
+          scriptPubKey: output.scriptPubkey().toString(),
+          amount: amount == null ? undefined : String(amount),
+          assetId: output.asset()?.toString(),
+          blinderIndex: output.blinderIndex()
+        }
+      }),
+      fee: String(balance.fee()),
+      balances: Array.from(balance.balances().entries(), ([asset, amount]) => ({
+        assetId: String(asset),
+        amount: String(amount)
+      })),
+      recipients: balance.recipients().map((recipient) => {
+        const amount = recipient.value()
+        return {
+          vout: recipient.vout(),
+          address: recipient.address()?.toString(),
+          assetId: recipient.asset()?.toString(),
+          amount: amount == null ? undefined : String(amount)
+        }
+      }),
+      issuances: details.inputsIssuances().map((issuance, index) => ({
+        inputIndex: index,
+        type: issuance.isReissuance() ? 'reissuance' : (issuance.isIssuance() ? 'issuance' : 'none'),
+        assetId: issuance.asset()?.toString(),
+        tokenId: issuance.token()?.toString(),
+        previousTxid: issuance.prevTxid()?.toString(),
+        previousVout: issuance.prevVout()
+      })),
+      signatures: signatures.map((entry, index) => ({
+        inputIndex: index,
+        present: signatureCount(entry.hasSignature()),
+        missing: signatureCount(entry.missingSignature())
+      }))
+    }
+  }
+
+  /** Parse an external PSET and return only structured, review-safe fields. */
+  async inspectPset (psetBase64) {
+    return this._run(async () => {
+      this._ensureReady()
+      requireBindingFeature(this.getSimplicityCapabilities(), 'pset.inspect')
+      return this._inspectPsetObject(new this._lwk.Pset(psetBase64))
+    })
+  }
+
+  /** Blind an external PSET with this wallet's confidential descriptor. */
+  async blindPset (psetBase64) {
+    return this._run(async () => {
+      this._ensureReady()
+      requireBindingFeature(this.getSimplicityCapabilities(), 'pset.blind')
+      const blinded = this._wollet.blind(new this._lwk.Pset(psetBase64))
+      return blinded.toString()
+    })
+  }
+
+  /**
+   * Sign wallet-owned PSET inputs. When `inputIndexes` is provided, fail closed
+   * if LWK signs any additional input; a rejected result is never returned.
+   */
+  async signPset ({ pset, inputIndexes }) {
+    return this._run(async () => {
+      this._ensureReady()
+      requireBindingFeature(this.getSimplicityCapabilities(), 'pset.sign')
+      const parsed = new this._lwk.Pset(pset)
+      const before = this._inspectPsetObject(parsed)
+      let allowed = null
+      if (inputIndexes != null) {
+        if (!Array.isArray(inputIndexes) || inputIndexes.length === 0) {
+          throw new TypeError('signPset.inputIndexes must be a non-empty array when provided')
+        }
+        allowed = new Set(inputIndexes)
+        for (const index of allowed) {
+          if (!Number.isInteger(index) || index < 0 || index >= before.inputCount) {
+            throw new RangeError(`signPset input index out of range: ${index}`)
+          }
+        }
+      }
+
+      const signed = await this._signer.sign(parsed)
+      const after = this._inspectPsetObject(signed)
+      const signedInputIndexes = after.signatures
+        .filter((entry, index) => entry.present > (before.signatures[index]?.present ?? 0))
+        .map((entry) => entry.inputIndex)
+      const unexpected = allowed == null ? [] : signedInputIndexes.filter((index) => !allowed.has(index))
+      if (unexpected.length) {
+        throw new Error(`LiquidAccount.signPset refused signatures outside the allowlist: ${unexpected.join(', ')}`)
+      }
+      return {
+        pset: signed.toString(),
+        signedInputIndexes,
+        unchanged: signedInputIndexes.length === 0
+      }
+    })
+  }
+
+  /** Finalize a fully signed PSET without broadcasting it. */
+  async finalizePset (psetBase64) {
+    return this._run(async () => {
+      this._ensureReady()
+      requireBindingFeature(this.getSimplicityCapabilities(), 'pset.finalize')
+      const finalized = this._wollet.finalize(new this._lwk.Pset(psetBase64))
+      const transaction = finalized.extractTx()
+      return {
+        pset: finalized.toString(),
+        transactionHex: transaction.toString(),
+        txid: transaction.txid().toString()
+      }
+    })
+  }
+
+  /** Broadcast a finalized PSET through the configured Esplora provider. */
+  async broadcastPset (psetBase64) {
+    return this._run(async () => {
+      this._ensureReady()
+      const txid = await this._esplora.broadcast(new this._lwk.Pset(psetBase64))
+      return { txid: txid.toString() }
+    })
+  }
+
+  /** Derive an x-only public key for a Simplicity program argument. */
+  async deriveSimplicityPublicKey (derivationPath) {
+    return this._run(async () => {
+      this._ensureReady()
+      requireBindingFeature(this.getSimplicityCapabilities(), 'simplicity.derivePublicKey')
+      const path = derivationPath ?? (this._networkName === 'mainnet' ? "m/86'/0'/0'/0/0" : "m/86'/1'/0'/0/0")
+      return {
+        publicKey: this._lwk.simplicityDeriveXonlyPubkey(this._signer, path).toString(),
+        derivationPath: path
+      }
+    })
+  }
+
+  /** Compile a parameterized SimplicityHL program and derive its P2TR address. */
+  async compileSimplicityProgram ({ source, arguments: values = [], internalKey, derivationPath }) {
+    return this._run(async () => {
+      this._ensureReady()
+      const capabilities = this.getSimplicityCapabilities()
+      requireBindingFeature(capabilities, 'simplicity.compile')
+      requireBindingFeature(capabilities, 'simplicity.derivePublicKey')
+      if (typeof source !== 'string' || source.trim().length === 0) {
+        throw new TypeError('compileSimplicityProgram.source is required')
+      }
+      const path = derivationPath ?? (this._networkName === 'mainnet' ? "m/86'/0'/0'/0/0" : "m/86'/1'/0'/0/0")
+      const walletPublicKey = this._lwk.simplicityDeriveXonlyPubkey(this._signer, path)
+      const taprootInternalKey = internalKey ?? SIMPLICITY_NUMS_INTERNAL_KEY
+      const program = this._lwk.SimplicityProgram.load(
+        source,
+        buildSimplicityArguments(this._lwk, values)
+      )
+      return {
+        cmr: program.cmr.toString(),
+        address: program.createP2trAddress(
+          this._lwk.XOnlyPublicKey.fromString(taprootInternalKey),
+          this._network
+        ).toString(),
+        internalKey: taprootInternalKey,
+        walletPublicKey: walletPublicKey.toString(),
+        derivationPath: path
+      }
+    })
+  }
+
+  /**
    * Frees the underlying WASM handles.
    */
   dispose () {
@@ -415,7 +621,7 @@ export class LiquidAccount {
       // identifier from the 4-byte key-origin fingerprint in keyoriginXpub, e.g.
       // "[7f3c2a1b/84'/1'/0']xpub...". Best-effort; empty if unavailable.
       try {
-        const ko = this._signer.keyoriginXpub(lwk.Bip.newBip84())
+        const ko = this._signer.keyoriginXpub(this._lwk.Bip.newBip84())
         hex = (String(ko).match(/\[([0-9a-fA-F]{8})/) || [])[1] || ''
       } catch { hex = '' }
     }
@@ -444,9 +650,9 @@ export class LiquidAccount {
       // Consuming builder — see `transfer`: reassign after every chain call.
       let builder = this._network.txBuilder()
       builder = builder.addRecipient(
-        lwk.Address.parse(recipient, this._network),
+        this._lwk.Address.parse(recipient, this._network),
         BigInt(amount),
-        lwk.AssetId.fromString(assetId)
+        this._lwk.AssetId.fromString(assetId)
       )
       if (feeRate != null) builder = builder.feeRate(feeRate)
       return this._buildSignBroadcast(builder)

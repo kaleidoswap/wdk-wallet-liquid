@@ -1,4 +1,5 @@
 node_modules/
+artifacts/lwk_wasm_simplicity/
 coverage/
 *.log
 .npmrc
