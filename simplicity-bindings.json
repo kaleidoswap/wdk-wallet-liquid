@@ -1,0 +1,8 @@
+{
+  "repository": "https://github.com/lukachi/lwk.git",
+  "commit": "693c4fb328eceb7bc858a0ee7a63752bce6b1a94",
+  "crateDirectory": "lwk_wasm",
+  "rustToolchain": "1.85.0",
+  "target": "bundler",
+  "features": ["simplicity"]
+}

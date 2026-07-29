@@ -58,6 +58,24 @@ There is **no async init step** — the bundler instantiates the WASM during
 module load, so the API is identical to the Node path. (The `lwk_wasm` bundle
 is ~10 MB; mind cold-start in constrained contexts.)
 
+### Experimental Simplicity binding
+
+The published `lwk_wasm` package does not include LWK's optional Simplicity
+feature. This repository therefore pins the exact LWK fork and commit used by
+Humid in [`simplicity-bindings.json`](./simplicity-bindings.json). Build the
+browser artifact with:
+
+```sh
+npm run build:lwk-simplicity
+npm install ./artifacts/lwk_wasm_simplicity
+```
+
+CI runs the same build on Linux and uploads the generated package plus a
+SHA-256 build manifest. The build is intentionally not performed during
+`npm install`; hosts must opt into the experimental binding. Runtime APIs use
+feature detection and return an unavailable capability result when a normal
+LWK package or the React Native binding is active.
+
 ## Architecture
 
 Liquid keys live in-process. LWK provides a watch-only Confidential
@@ -86,6 +104,20 @@ await account.sendAsset({ assetId, recipient, amount, feeRate })
 await account.listAssets()
 await account.listUnspents()
 await account.listTransactions()
+
+const capabilities = account.getSimplicityCapabilities()
+if (capabilities.simplicity.compile) {
+  const contract = await account.compileSimplicityProgram({
+    source: simplicityHlSource,
+    arguments: [{ name: 'PUBLIC_KEY', type: 'u256', value: xOnlyPublicKey }],
+  })
+  console.log(contract.cmr, contract.address)
+}
+
+// External PSET signing can be constrained to reviewed inputs. The call fails
+// closed if the underlying signer adds a signature outside this allowlist.
+const review = await account.inspectPset(psetBase64)
+const signed = await account.signPset({ pset: review.pset, inputIndexes: [0] })
 
 wallet.dispose()
 ```

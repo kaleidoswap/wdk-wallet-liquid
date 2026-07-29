@@ -1,6 +1,6 @@
 {
   "name": "@kaleidorg/wdk-wallet-liquid",
-  "version": "1.0.0-beta.6",
+  "version": "1.0.0-beta.7",
   "description": "WDK wallet adapter for the Liquid network — wraps an in-process LWK (Liquid Wallet Kit) wallet in the WDK account model.",
   "keywords": [
     "wdk",
@@ -40,18 +40,23 @@
     "bare.js",
     "src/",
     "types/",
-    "README.md"
+    "README.md",
+    "scripts/build-lwk-simplicity.mjs",
+    "scripts/verify-package.mjs",
+    "simplicity-bindings.json"
   ],
   "scripts": {
+    "build:lwk-simplicity": "node scripts/build-lwk-simplicity.mjs",
     "test": "cross-env NODE_OPTIONS=--experimental-vm-modules jest",
-    "test:coverage": "cross-env NODE_OPTIONS=--experimental-vm-modules jest --coverage"
+    "test:coverage": "cross-env NODE_OPTIONS=--experimental-vm-modules jest --coverage",
+    "test:package": "node scripts/verify-package.mjs"
   },
   "dependencies": {
-    "lwk_node": "^0.17.1"
+    "lwk_node": "^0.18.0"
   },
   "peerDependencies": {
     "@tetherto/wdk-wallet": "^1.0.0-beta.6",
-    "lwk_wasm": "^0.17.2",
+    "lwk_wasm": "^0.18.0",
     "lwk-rn": "^0.9.0-2.0.3"
   },
   "peerDependenciesMeta": {

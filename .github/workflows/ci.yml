@@ -28,3 +28,6 @@ jobs:
 
       - name: Test (jest, node #lwk binding)
         run: npm test
+
+      - name: Verify release tarball contents
+        run: npm run test:package
