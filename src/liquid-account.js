@@ -49,6 +49,53 @@ import {
  * @property {(warning: {code: string, message: string, details?: object}) => (void | Promise<void>)} [onWarning]
  *   Called when Waterfalls fails and the account recovers with standard Esplora.
  * @property {number} [scanTimeoutMs] - Watchdog for a wedged Esplora full-scan (default: 30000).
+ * @property {LiquidSecretsStore} [secretsStore] - Durable sink for the unblinding data of
+ *   confidential outputs this wallet receives. Strongly recommended: see
+ *   {@link LiquidSecretsStore}. Omitted, the account still works but keeps no record.
+ */
+
+/**
+ * The unblinding data of a single confidential output, as observed.
+ *
+ * `value` is a decimal string and the two blinding factors are hex strings, so a
+ * record is plain JSON — no BigInt or wasm handles — and survives a structured
+ * clone, `JSON.stringify`, or a remote backup unchanged. The hex encoding is
+ * whatever `AssetBlindingFactor`/`ValueBlindingFactor#toString()` produce, which
+ * their matching `fromString()` accepts verbatim.
+ *
+ * @typedef {Object} LiquidOutputSecretsRecord
+ * @property {string} txid - Funding transaction id, display (big-endian) order.
+ * @property {number} vout - Output index within `txid`.
+ * @property {string} assetId - Unblinded asset id hex (64 chars).
+ * @property {string} value - Unblinded amount in the asset's smallest unit, decimal.
+ * @property {string} assetBlindingFactor - ABF hex (64 chars).
+ * @property {string} valueBlindingFactor - VBF hex (64 chars).
+ */
+
+/**
+ * Host-supplied durable store for confidential outputs' unblinding data.
+ *
+ * Why this exists: a confidential output's asset, amount and blinding factors
+ * are not determined by the descriptor. Restoring the mnemonic re-derives every
+ * address, but it does NOT by itself reconstruct these four values — they are
+ * read back out of the funding transaction, which is not the stable source one
+ * might assume. So the usual "the seed is the only backup" assumption does not
+ * hold on Liquid for confidential outputs, and a wallet that keeps no record of
+ * what it unblinded has no second source if that read ever stops working.
+ *
+ * The account writes each newly observed output through exactly once, right
+ * after the scan that revealed it. The store owns durability, namespacing (per
+ * wallet and per network) and retention — a record stays relevant until its
+ * outpoint is spent. `put` receives only records not already written during this
+ * account's lifetime, so it is called rarely rather than on every sync.
+ *
+ * Treat the contents as key material, not as display data: the blinding factors
+ * are what make an output's amount and asset legible. They are deliberately kept
+ * out of `listUnspents()` and every other read API for that reason.
+ *
+ * @typedef {Object} LiquidSecretsStore
+ * @property {(records: LiquidOutputSecretsRecord[]) => (void | Promise<void>)} put
+ *   Persist a batch of newly observed records. Must be idempotent per outpoint.
  */
 
 function buildNetwork (binding, name) {
@@ -119,6 +166,12 @@ export class LiquidAccount {
     // EsploraClient. Reset whenever the client is rebuilt (see _ensureReady).
     this._waterfallsRecipientApplied = false
     this._scanTimeoutMs = config.scanTimeoutMs ?? DEFAULT_SCAN_TIMEOUT_MS
+    this._secretsStore = typeof config.secretsStore?.put === 'function' ? config.secretsStore : null
+    // Outpoints already written through to `_secretsStore` in this account's
+    // lifetime, so a steady-state sync writes nothing. Intentionally in-memory:
+    // durability is the store's job, and a fresh process re-writing what it
+    // re-observes is harmless because `put` is idempotent per outpoint.
+    this._recordedSecretKeys = new Set()
     this._ready = false
     // FIFO queue serializing every op that borrows the LWK Wollet (see `_run`).
     this._opChain = Promise.resolve()
@@ -195,6 +248,9 @@ export class LiquidAccount {
       if (update) this._wollet.applyUpdate(update)
       this._lastSyncAt = Date.now()
       console.info(`[LiquidAccount] ${scanKind} done in ${Date.now() - t0}ms`)
+      // The scan that revealed an output is the one chance to record what it
+      // unblinded to, so this runs on every applied update rather than lazily.
+      await this._recordOutputSecrets()
     } catch (err) {
       console.error(`[LiquidAccount] ${scanKind} FAILED after ${Date.now() - t0}ms`)
       const timedOut = /timed out/.test(String(err?.message ?? ''))
@@ -246,6 +302,65 @@ export class LiquidAccount {
       throw err
     } finally {
       clearTimeout(timer)
+    }
+  }
+
+  /**
+   * Writes the unblinding data of every confidential UTXO not yet recorded
+   * through to `_secretsStore`. See {@link LiquidSecretsStore} for why this data
+   * is worth keeping and why the store, not this class, owns durability.
+   *
+   * Explicit (unblinded) outputs are skipped: their asset and amount are already
+   * on-chain in the clear and their blinding factors are zero, so there is
+   * nothing about them that a rescan could fail to recover.
+   *
+   * Never throws. This runs inside `_sync`, so letting a store failure escape
+   * would take down every balance and address read behind it — a wallet that
+   * cannot show a balance is a worse outcome than one that missed a write, and
+   * the next sync retries anyway since the key is only marked on success.
+   *
+   * Callers must already hold the `_run` queue: this borrows the Wollet.
+   *
+   * @private
+   * @returns {Promise<void>}
+   */
+  async _recordOutputSecrets () {
+    if (!this._secretsStore) return
+    /** @type {LiquidOutputSecretsRecord[]} */
+    const pending = []
+    /** @type {string[]} */
+    const pendingKeys = []
+    try {
+      for (const utxo of this._wollet.utxos()) {
+        const secrets = utxo.unblinded()
+        if (!secrets || secrets.isExplicit()) continue
+        const outpoint = utxo.outpoint()
+        const txid = outpoint.txid().toString()
+        const vout = outpoint.vout()
+        const key = `${txid}:${vout}`
+        if (this._recordedSecretKeys.has(key)) continue
+        pending.push({
+          txid,
+          vout,
+          assetId: secrets.asset().toString(),
+          value: String(secrets.value()),
+          assetBlindingFactor: secrets.assetBlindingFactor().toString(),
+          valueBlindingFactor: secrets.valueBlindingFactor().toString()
+        })
+        pendingKeys.push(key)
+      }
+      if (pending.length === 0) return
+      await this._secretsStore.put(pending)
+      // Only after a settled write, so a rejected put is retried next sync.
+      for (const key of pendingKeys) this._recordedSecretKeys.add(key)
+      console.info(`[LiquidAccount] recorded unblinding data for ${pending.length} output(s)`)
+    } catch (err) {
+      // Deliberately no record contents in the log — the blinding factors are
+      // what make an output legible, so they must not reach a log sink.
+      console.error(
+        `[LiquidAccount] failed to record unblinding data for ${pending.length} output(s):`,
+        err?.message ?? err
+      )
     }
   }
 
