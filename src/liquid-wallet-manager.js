@@ -31,6 +31,9 @@ import { LiquidAccount } from './liquid-account.js'
  * @property {(warning: {code: string, message: string, details?: object}) => (void | Promise<void>)} [onWarning]
  *   Called when Waterfalls fails and the account recovers with standard Esplora.
  * @property {string} [mnemonic] - BIP-39 mnemonic; required only when the seed is passed as bytes.
+ * @property {import('./liquid-account.js').LiquidSecretsStore} [secretsStore] - Durable sink for
+ *   the unblinding data of confidential outputs. Strongly recommended — a seed-only restore does
+ *   not reconstruct it. See `LiquidSecretsStore` in liquid-account.js.
  */
 
 /**
@@ -66,7 +69,8 @@ export default class LiquidWalletManager extends WalletManager {
       allowDefaultEsploraFallback: config.allowDefaultEsploraFallback,
       waterfallsRecipient: config.waterfallsRecipient,
       onWarning: config.onWarning,
-      scanTimeoutMs: config.scanTimeoutMs
+      scanTimeoutMs: config.scanTimeoutMs,
+      secretsStore: config.secretsStore
     })
   }
 

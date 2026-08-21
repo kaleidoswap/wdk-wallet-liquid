@@ -49,6 +49,50 @@ export interface LiquidWalletConfig {
   onWarning?: (warning: LiquidSyncWarning) => void | Promise<void>
   /** Watchdog for a wedged Esplora full-scan, in ms (default: 30000). */
   scanTimeoutMs?: number
+  /**
+   * Durable sink for the unblinding data of confidential outputs this wallet receives.
+   * Strongly recommended — a seed-only restore does not reconstruct it. See
+   * {@link LiquidSecretsStore}.
+   */
+  secretsStore?: LiquidSecretsStore
+}
+
+/** The unblinding data of a single confidential output, as observed. */
+export interface LiquidOutputSecretsRecord {
+  /** Funding transaction id, display (big-endian) order. */
+  txid: string
+  /** Output index within `txid`. */
+  vout: number
+  /** Unblinded asset id hex (64 chars). */
+  assetId: string
+  /** Unblinded amount in the asset's smallest unit, as a decimal string. */
+  value: string
+  /** Asset blinding factor hex (64 chars). */
+  assetBlindingFactor: string
+  /** Value blinding factor hex (64 chars). */
+  valueBlindingFactor: string
+}
+
+/**
+ * Host-supplied durable store for confidential outputs' unblinding data.
+ *
+ * A confidential output's asset, amount and blinding factors are not determined by the
+ * descriptor, so restoring the mnemonic re-derives every address without reconstructing
+ * these four values — they are read back out of the funding transaction, which is not the
+ * stable source one might assume. A wallet that keeps no record of what it unblinded has
+ * no second source if that read ever stops working.
+ *
+ * The account writes each newly observed output through exactly once, right after the scan
+ * that revealed it. The store owns durability, namespacing (per wallet and per network) and
+ * retention — a record stays relevant until its outpoint is spent.
+ *
+ * Treat the contents as key material, not display data: the blinding factors are what make
+ * an output's amount and asset legible. They are deliberately absent from `listUnspents()`
+ * and every other read API.
+ */
+export interface LiquidSecretsStore {
+  /** Persist a batch of newly observed records. Must be idempotent per outpoint. */
+  put (records: LiquidOutputSecretsRecord[]): void | Promise<void>
 }
 
 export interface TransferResult {

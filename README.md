@@ -129,6 +129,41 @@ wallet.dispose()
 | `network`    | `'testnet'` | `'mainnet'`, `'testnet'` or `'regtest'`.          |
 | `esploraUrl` | network default | Esplora API base URL.                         |
 | `mnemonic`   | —           | Required only when the seed is passed as bytes.   |
+| `secretsStore` | —         | Durable sink for confidential outputs' unblinding data. See below. |
+
+#### `secretsStore`
+
+A confidential Liquid output's asset, amount and blinding factors are not
+determined by the descriptor. Restoring the mnemonic re-derives every address,
+but it does not by itself reconstruct those four values — they are read back out
+of the funding transaction, which is not the stable source one might assume. So
+"the seed is the only backup" does not hold on Liquid for confidential outputs.
+
+Supply a `secretsStore` and the account writes each newly observed output through
+once, right after the scan that revealed it:
+
+```js
+const wallet = new LiquidWalletManager(mnemonic, {
+  network: 'mainnet',
+  secretsStore: {
+    // Called only with outpoints not already written in this process.
+    // Must be idempotent per outpoint.
+    async put (records) {
+      await myDurableStore.merge(records)
+    }
+  }
+})
+```
+
+Each record is plain JSON — `{ txid, vout, assetId, value, assetBlindingFactor,
+valueBlindingFactor }`, with `value` a decimal string — so it survives
+`JSON.stringify`, a structured clone or a remote backup unchanged.
+
+The store owns durability, namespacing (per wallet and per network) and
+retention; a record stays relevant until its outpoint is spent. Treat its
+contents as key material rather than display data: the blinding factors are what
+make an output's amount and asset legible, which is why they are absent from
+`listUnspents()` and every other read API.
 
 ## Test
 
