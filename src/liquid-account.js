@@ -453,6 +453,64 @@ export class LiquidAccount {
   }
 
   /**
+   * Parses a recipient address, confidential or not.
+   *
+   * `Address.parse` refuses an unconfidential address outright — "Expected a
+   * blinded address but got a non-blinded one" — so it cannot be the only way
+   * in. Liquid's explicit addresses are valid and in real use: swap HTLCs are
+   * commonly minted unconfidential so that a watcher can read the output's
+   * asset and value without holding a blinding key.
+   *
+   * `new Address(s)` is the lenient constructor and takes both. What it does
+   * NOT do is check the network, which is the reason `parse` was used here, so
+   * the network is checked explicitly rather than dropped: sending testnet
+   * funds to a mainnet address is a worse failure than the one being fixed.
+   * That check is coarser than `parse`'s — the binding only exposes
+   * `isMainnet()`, so it separates mainnet from the rest but lets testnet and
+   * regtest pass for each other. Both are worthless-coin networks; confusing
+   * them cannot lose real funds, which is what this guard is for.
+   *
+   * @param {string} recipient
+   * @returns {object} An lwk `Address`.
+   */
+  _parseRecipient (recipient) {
+    try {
+      return this._lwk.Address.parse(recipient, this._network)
+    } catch (err) {
+      const address = new this._lwk.Address(recipient)
+      if (address.isMainnet() !== this._network.isMainnet()) {
+        throw err
+      }
+      return address
+    }
+  }
+
+  /**
+   * Adds an unconfidential output to `builder`.
+   *
+   * `addLbtcRecipient` / `addRecipient` blind the output they add and refuse an
+   * address that carries no blinding key, so an explicit recipient has to go
+   * through `addExplicitRecipient`. That method exists on the wasm-bindgen
+   * bindings (lwk_wasm / lwk_node) but not on the React Native UniFFI binding
+   * (lwk-rn), so feature-detect it the way `sign` does and fail with a readable
+   * message instead of "addExplicitRecipient is not a function".
+   *
+   * @param {object} builder - lwk `TxBuilder` (consumed; use the return value).
+   * @param {object} address - lwk `Address`, unconfidential.
+   * @param {bigint} amount
+   * @param {object} asset - lwk `AssetId`.
+   * @returns {object} The next builder in the chain.
+   */
+  _addExplicitRecipient (builder, address, amount, asset) {
+    if (typeof builder.addExplicitRecipient !== 'function') {
+      throw new Error(
+        'LiquidAccount: sending to an unconfidential address is not supported by the active LWK binding (react-native)'
+      )
+    }
+    return builder.addExplicitRecipient(address, amount, asset)
+  }
+
+  /**
    * Sends L-BTC on the Liquid network.
    *
    * NB: `feeRate` is in **sat/kvB** (lwk convention; its default is 100, i.e.
@@ -467,7 +525,7 @@ export class LiquidAccount {
   async transfer ({ recipient, amount, feeRate }) {
     return this._run(async () => {
       await this._sync(true) // sends must build against fresh UTXOs
-      const address = this._lwk.Address.parse(recipient, this._network)
+      const address = this._parseRecipient(recipient)
       const requested = BigInt(amount)
       // lwk's TxBuilder is a CONSUMING builder (wasm-bindgen moves `self`):
       // every chain method invalidates the receiver and returns a fresh
@@ -482,9 +540,29 @@ export class LiquidAccount {
       // fee deducted from the amount. (You can never send more than the balance,
       // so `>=` uniquely means "send all, net of fee".)
       const policyBalance = this._balanceOf(this._network.policyAsset().toString())
+      const explicit = !address.isBlinded()
       if (requested >= policyBalance) {
+        // Send-max to an explicit address has no working form: draining leaves
+        // the recipient as the only non-fee output, so nothing in the
+        // transaction is blinded and `finish()` dies in lwk's `blind_last`
+        // ("Atleast one output secrets should be provided"). Refuse it up front
+        // rather than surface that from deep inside the builder.
+        if (explicit) {
+          throw new Error(
+            'LiquidAccount.transfer: cannot send the whole L-BTC balance to an unconfidential address — ' +
+            'the drained transaction would have no blinded output for lwk to blind. ' +
+            'Send less than the full balance, or use a confidential recipient.'
+          )
+        }
         builder = builder.drainLbtcWallet()
         builder = builder.drainLbtcTo(address)
+      } else if (explicit) {
+        builder = this._addExplicitRecipient(
+          builder,
+          address,
+          requested,
+          this._network.policyAsset()
+        )
       } else {
         builder = builder.addLbtcRecipient(address, requested)
       }
@@ -764,11 +842,13 @@ export class LiquidAccount {
       await this._sync(true) // sends must build against fresh UTXOs
       // Consuming builder — see `transfer`: reassign after every chain call.
       let builder = this._network.txBuilder()
-      builder = builder.addRecipient(
-        this._lwk.Address.parse(recipient, this._network),
-        BigInt(amount),
-        this._lwk.AssetId.fromString(assetId)
-      )
+      // Same split as `transfer`: an explicit recipient cannot go through
+      // `addRecipient`, which blinds the output.
+      const address = this._parseRecipient(recipient)
+      const asset = this._lwk.AssetId.fromString(assetId)
+      builder = address.isBlinded()
+        ? builder.addRecipient(address, BigInt(amount), asset)
+        : this._addExplicitRecipient(builder, address, BigInt(amount), asset)
       if (feeRate != null) builder = builder.feeRate(feeRate)
       return this._buildSignBroadcast(builder)
     })

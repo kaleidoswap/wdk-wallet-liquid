@@ -52,7 +52,10 @@ Ensure your Metro config resolves the `react-native` export condition
 (`resolver.unstable_conditionNames = ['react-native', 'require', 'import']`).
 The `lwk-rn` `Signer` lacks `signMessage()` / `getMasterXpub()`; `LiquidAccount`
 feature-detects those (message signing throws on RN; `keyPair` falls back to the
-key-origin fingerprint), so the core wallet works unchanged.
+key-origin fingerprint), so the core wallet works unchanged. Its `TxBuilder`
+likewise lacks `addExplicitRecipient()` (as of `lwk-rn` 0.9.0-2.0.3), so paying
+an **unconfidential** recipient (see below) throws a readable error on React
+Native; confidential recipients are unaffected.
 
 There is **no async init step** — the bundler instantiates the WASM during
 module load, so the API is identical to the Node path. (The `lwk_wasm` bundle
@@ -121,6 +124,20 @@ const signed = await account.signPset({ pset: review.pset, inputIndexes: [0] })
 
 wallet.dispose()
 ```
+
+### Unconfidential recipients
+
+Liquid addresses come confidential (`lq1…` / `tlq1…`) or explicit (`ex1…` /
+`tex1…` / `ert1…`). `transfer` and `sendAsset` take both: an explicit recipient
+is paid with an unblinded output, a confidential one exactly as before. Two
+limits apply to the explicit path:
+
+- **Send-max is refused.** Draining the whole L-BTC balance to an explicit
+  address leaves the transaction with no blinded output for LWK to blind, which
+  it rejects. Send less than the full balance, or use a confidential recipient.
+- **Not available on React Native.** `lwk-rn` has no `addExplicitRecipient()`,
+  so the call throws a readable error there rather than building a transaction
+  that cannot be blinded.
 
 ### Config
 
