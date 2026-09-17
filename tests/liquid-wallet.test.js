@@ -641,6 +641,192 @@ describe('LiquidAccount', () => {
     account.dispose()
   })
 
+  // -------------------------------------------------------------------------
+  // Unconfidential (explicit) recipients
+  // -------------------------------------------------------------------------
+
+  // Liquid addresses come confidential (`tlq1…`) or explicit (`tex1…`).
+  // `addLbtcRecipient` / `addRecipient` blind the output they add and refuse an
+  // address with no blinding key, so an explicit recipient has to be routed
+  // through `addExplicitRecipient`. These cover that split.
+
+  // Stub builder that records which recipient method was used. `explicit:
+  // false` models a binding without `addExplicitRecipient` (lwk-rn).
+  function recordingBuilder (calls, { explicit = true } = {}) {
+    function make () {
+      let dead = false
+      const consume = () => { if (dead) throw new Error('null pointer passed to rust'); dead = true }
+      const builder = {
+        addLbtcRecipient () { consume(); calls.addLbtc++; return make() },
+        addRecipient () { consume(); calls.addRecipient++; return make() },
+        drainLbtcWallet () { consume(); calls.drainWallet++; return make() },
+        drainLbtcTo () { consume(); calls.drainTo++; return make() },
+        feeRate () { consume(); return make() },
+        finish () { consume(); return { fake: 'pset' } }
+      }
+      if (explicit) {
+        builder.addExplicitRecipient = function (_a, sats) {
+          consume()
+          calls.addExplicit++
+          calls.sats.push(sats)
+          return make()
+        }
+      }
+      return builder
+    }
+    return make
+  }
+
+  // An offline account with the send pipeline stubbed out.
+  async function sendableAccount (calls, opts = {}) {
+    const account = new LiquidAccount({ mnemonic: SEED })
+    account._ensureReady()
+    account._network.txBuilder = recordingBuilder(calls, opts)
+    account._network.policyAsset = () => ({ toString: () => 'lbtc' })
+    account._wollet.balance = () => new Map([['lbtc', 1_000_000n]])
+    account._wollet.psetDetails = () => ({ balance: () => ({ fee: () => 100 }) })
+    account._signer.sign = (pset) => pset
+    account._wollet.finalize = (pset) => pset
+    account._esplora = { fullScan: async () => null, broadcast: async () => 'txid-explicit' }
+    account._lastSyncAt = Date.now() // fresh — skip the forced pre-send scan
+    return account
+  }
+
+  const noCalls = () => ({ addLbtc: 0, addRecipient: 0, addExplicit: 0, drainWallet: 0, drainTo: 0, sats: [] })
+
+  // Strip the blinding key off the wallet's own address to get a real,
+  // correctly-networked explicit address instead of hardcoding a fixture.
+  async function explicitAddressOf (account) {
+    const confidential = await account.getAddress()
+    return new account._lwk.Address(confidential).toUnconfidential().toString()
+  }
+
+  test('transfer routes an explicit recipient through addExplicitRecipient', async () => {
+    const calls = noCalls()
+    const account = await sendableAccount(calls)
+    const explicit = await explicitAddressOf(account)
+    expect(explicit.startsWith('tex1')).toBe(true) // unconfidential testnet
+
+    const res = await account.transfer({ recipient: explicit, amount: 1000n })
+    expect(res).toEqual({ hash: 'txid-explicit', fee: 100n })
+    expect(calls.addExplicit).toBe(1)
+    expect(calls.sats).toEqual([1000n])
+    expect(calls.addLbtc).toBe(0) // the blinding path must not be taken
+    expect(calls.drainTo).toBe(0)
+
+    account.dispose()
+  })
+
+  test('transfer keeps a confidential recipient on addLbtcRecipient', async () => {
+    const calls = noCalls()
+    const account = await sendableAccount(calls)
+    const confidential = await account.getAddress()
+
+    await account.transfer({ recipient: confidential, amount: 1000n })
+    expect(calls.addLbtc).toBe(1)
+    expect(calls.addExplicit).toBe(0)
+
+    account.dispose()
+  })
+
+  test('sendAsset routes an explicit recipient through addExplicitRecipient', async () => {
+    const calls = noCalls()
+    const account = await sendableAccount(calls)
+    const explicit = await explicitAddressOf(account)
+
+    const res = await account.sendAsset({
+      assetId: 'deadbeef'.repeat(8),
+      recipient: explicit,
+      amount: 5
+    })
+    expect(res).toEqual({ hash: 'txid-explicit', fee: 100n })
+    expect(calls.addExplicit).toBe(1)
+    expect(calls.addRecipient).toBe(0)
+
+    account.dispose()
+  })
+
+  test('sendAsset keeps a confidential recipient on addRecipient', async () => {
+    const calls = noCalls()
+    const account = await sendableAccount(calls)
+    const confidential = await account.getAddress()
+
+    await account.sendAsset({
+      assetId: 'deadbeef'.repeat(8),
+      recipient: confidential,
+      amount: 5
+    })
+    expect(calls.addRecipient).toBe(1)
+    expect(calls.addExplicit).toBe(0)
+
+    account.dispose()
+  })
+
+  test('send-max to an explicit address is refused before the builder runs', async () => {
+    // Draining to an explicit address leaves no blinded output, so lwk's
+    // `finish()` fails in blind_last with "Atleast one output secrets should be
+    // provided". Refuse it up front with a message that says what to do.
+    const calls = noCalls()
+    const account = await sendableAccount(calls)
+    const explicit = await explicitAddressOf(account)
+
+    await expect(account.transfer({ recipient: explicit, amount: 1_000_000n }))
+      .rejects.toThrow(/whole L-BTC balance to an unconfidential address/)
+    expect(calls.drainWallet).toBe(0) // rejected before touching the builder
+    expect(calls.drainTo).toBe(0)
+
+    // The same send-max to a confidential address still drains.
+    const confidential = await account.getAddress()
+    await account.transfer({ recipient: confidential, amount: 1_000_000n })
+    expect(calls.drainTo).toBe(1)
+
+    account.dispose()
+  })
+
+  test('a binding without addExplicitRecipient fails with a readable error', async () => {
+    // lwk-rn 0.9.0-2.0.3 exposes isBlinded/drainLbtcTo/addLbtcRecipient/
+    // addRecipient but not addExplicitRecipient; feature-detect it rather than
+    // throw "addExplicitRecipient is not a function" from inside the chain.
+    const calls = noCalls()
+    const account = await sendableAccount(calls, { explicit: false })
+    const explicit = await explicitAddressOf(account)
+
+    await expect(account.transfer({ recipient: explicit, amount: 1000n }))
+      .rejects.toThrow(/not supported by the active LWK binding \(react-native\)/)
+    await expect(account.sendAsset({
+      assetId: 'deadbeef'.repeat(8),
+      recipient: explicit,
+      amount: 5
+    })).rejects.toThrow(/not supported by the active LWK binding \(react-native\)/)
+
+    account.dispose()
+  })
+
+  test('a mainnet recipient is rejected by a testnet account', async () => {
+    // The lenient `new Address(s)` constructor skips the network validation
+    // `Address.parse` provided, so the fallback re-checks it: sending testnet
+    // funds to a mainnet address would be worse than the bug being fixed.
+    const mainnet = new LiquidAccount({ mnemonic: SEED, network: 'mainnet' })
+    mainnet._ensureReady()
+    const mainnetAddr = await mainnet.getAddress()
+    expect(mainnetAddr.startsWith('lq1')).toBe(true)
+    mainnet.dispose()
+
+    const calls = noCalls()
+    const account = await sendableAccount(calls)
+
+    await expect(account.transfer({ recipient: mainnetAddr, amount: 1000n })).rejects.toThrow()
+    await expect(account.sendAsset({
+      assetId: 'deadbeef'.repeat(8),
+      recipient: mainnetAddr,
+      amount: 5
+    })).rejects.toThrow()
+    expect(calls.addExplicit).toBe(0)
+    expect(calls.addLbtc).toBe(0)
+
+    account.dispose()
+  })
+
   test('listAssets materializes a non-array (Map) Balance.entries()', async () => {
     // lwk's `Balance.entries()` is an *iterable* of [asset, value] pairs, not a
     // plain array — it has no `.map`. Regression guard: listAssets must use
