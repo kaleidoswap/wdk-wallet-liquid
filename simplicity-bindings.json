@@ -1,6 +1,6 @@
 {
-  "repository": "https://github.com/lukachi/lwk.git",
-  "commit": "693c4fb328eceb7bc858a0ee7a63752bce6b1a94",
+  "repository": "https://github.com/kaleidoswap/lwk.git",
+  "commit": "171c53d5025ae65185defcf8913d24e3d83ece96",
   "crateDirectory": "lwk_wasm",
   "rustToolchain": "1.85.0",
   "target": "bundler",
