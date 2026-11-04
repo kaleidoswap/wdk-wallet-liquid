@@ -811,6 +811,12 @@ export class LiquidAccount {
       }
 
       await this._sync(true) // fee inputs must come from fresh UTXOs
+      const ownsSwapInput = this._wollet.utxos().some(
+        (utxo) => utxo.outpoint().txid().toString() === swapTxid && utxo.outpoint().vout() === swapVout
+      )
+      if (ownsSwapInput) {
+        throw new Error('LiquidAccount.fundLiquidPset: the swap input is one of this wallet\'s own outputs')
+      }
       const swapAsset = lwk.AssetId.fromString(swapAssetId)
       const external = new lwk.ExternalUtxo(
         swapVout,
@@ -847,6 +853,12 @@ export class LiquidAccount {
       )
       if (swapInputs.length !== 1) {
         throw new Error('LiquidAccount.fundLiquidPset: the built transaction does not spend the swap input once')
+      }
+      // The swap input is the caller's to finalize: fail closed if it got signed.
+      const swapIndex = inputs.indexOf(swapInputs[0])
+      const signatures = this._wollet.psetDetails(signed).signatures()
+      if (signatureCount(signatures[swapIndex]?.hasSignature()) > 0) {
+        throw new Error('LiquidAccount.fundLiquidPset: refused a signature on the swap input')
       }
 
       let secrets

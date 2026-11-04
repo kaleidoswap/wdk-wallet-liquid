@@ -26,7 +26,7 @@ function fakeLwk () {
   }
 }
 
-async function setup ({ fee = 120n, builtOutputs } = {}) {
+async function setup ({ fee = 120n, builtOutputs, owned = [], signedSwap = 0 } = {}) {
   const manager = new LiquidWalletManager(SEED)
   const account = await manager.getAccount(0)
   const swapInput = { previousTxid: () => wrap(SWAP_TXID), previousVout: () => 1 }
@@ -56,7 +56,13 @@ async function setup ({ fee = 120n, builtOutputs } = {}) {
         finish: () => ({ toString: () => 'built', ...built, inputs: () => built.inputs, outputs: () => built.outputs })
       })
     },
-    _wollet: { psetDetails: () => ({ balance: () => ({ fee: () => fee }) }) },
+    _wollet: {
+      utxos: () => owned,
+      psetDetails: () => ({
+        balance: () => ({ fee: () => fee }),
+        signatures: () => [{ hasSignature: () => (signedSwap ? ['key'] : []) }, { hasSignature: () => ['key'] }]
+      })
+    },
     _signer: { sign: () => new fake.Pset('signed') }
   })
   fake.Pset.prototype.inputs = function () { return this.b64 === 'template' ? template.inputs : built.inputs }
@@ -114,6 +120,19 @@ describe('LiquidAccount.fundLiquidPset', () => {
     const { account, request, manager } = await setup()
     account._parseRecipient = () => ({ isBlinded: () => false, scriptPubkey: () => wrap('elsewhere') })
     await expect(account.fundLiquidPset(request)).rejects.toThrow(/does not match the template payout/)
+    manager.dispose()
+  })
+
+  test('refuses a swap input that is one of the wallet\'s own outputs', async () => {
+    const owned = [{ outpoint: () => ({ txid: () => wrap(SWAP_TXID), vout: () => 1 }) }]
+    const { account, request, manager } = await setup({ owned })
+    await expect(account.fundLiquidPset(request)).rejects.toThrow(/own outputs/)
+    manager.dispose()
+  })
+
+  test('refuses a result where the swap input was signed', async () => {
+    const { account, request, manager } = await setup({ signedSwap: 1 })
+    await expect(account.fundLiquidPset(request)).rejects.toThrow(/signature on the swap input/)
     manager.dispose()
   })
 
