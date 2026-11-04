@@ -196,6 +196,28 @@ export class SimplicityUnavailableError extends Error {
   readonly feature: string
 }
 
+export interface LiquidPsetFundRequest {
+  pset: string
+  swapInputIndex: number
+  paymentOutputIndex: number
+  policyAssetId: string
+  maxFeeSat: number
+  outputAddress: string
+  swapAssetId: string
+  swapAmount: number | bigint | string
+  lockupTxHex: string
+}
+
+export interface LiquidPsetFundResult {
+  pset: string
+  paymentOutputSecrets: {
+    assetId: string
+    value: string
+    assetBlindingFactor: string
+    valueBlindingFactor: string
+  }
+}
+
 export class LiquidAccount {
   constructor (config: LiquidWalletConfig & { mnemonic: string })
 
@@ -210,6 +232,7 @@ export class LiquidAccount {
   signPset (request: { pset: string; inputIndexes?: number[] }): Promise<LiquidPsetSignResult>
   finalizePset (psetBase64: string): Promise<{ pset: string; transactionHex: string; txid: string }>
   broadcastPset (psetBase64: string): Promise<{ txid: string }>
+  fundLiquidPset (request: LiquidPsetFundRequest): Promise<LiquidPsetFundResult>
   deriveSimplicityPublicKey (derivationPath?: string): Promise<{ publicKey: string; derivationPath: string }>
   compileSimplicityProgram (request: {
     source: string

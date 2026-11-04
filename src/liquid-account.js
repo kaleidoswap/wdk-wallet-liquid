@@ -129,6 +129,11 @@ const FORCE_SYNC_TTL_MS = 2_500
 // because the zombie scan only ever touches the orphaned Wollet.
 const DEFAULT_SCAN_TIMEOUT_MS = 30_000
 
+// Witness weight lwk budgets for the swap input when pricing the fee. Covers a
+// taproot script-path claim (signature, preimage, script, control block) with
+// headroom; the cap check in `fundLiquidPset` bounds an over-estimate.
+const HTLC_SPEND_MAX_WEIGHT = 400
+
 /**
  * WDK-compatible account that wraps an in-process LWK (Liquid Wallet Kit)
  * watch-only `Wollet` plus a software `Signer` derived from a BIP-39 mnemonic.
@@ -740,6 +745,149 @@ export class LiquidAccount {
       this._ensureReady()
       const txid = await this._esplora.broadcast(new this._lwk.Pset(psetBase64))
       return { txid: txid.toString() }
+    })
+  }
+
+  /**
+   * Funds a caller-built Liquid PSET template (an HTLC input plus a full-value
+   * payout) with L-BTC for the network fee, blinds the outputs this wallet adds
+   * and signs only its own inputs. The swap input stays unsigned.
+   *
+   * lwk cannot add inputs to an existing PSET, so the transaction is rebuilt
+   * around the swap input as an external UTXO and the template is used only to
+   * check that the caller's intent (input, payout script) is what gets built.
+   * The returned PSET orders inputs and outputs freely; the caller locates the
+   * swap input and the payout by outpoint and script.
+   *
+   * @param {object} params
+   * @param {string} params.pset - Base64 template.
+   * @param {number} params.swapInputIndex
+   * @param {number} params.paymentOutputIndex
+   * @param {string} params.policyAssetId - L-BTC asset id; must be the network's.
+   * @param {number} params.maxFeeSat - Fee ceiling; a dearer build is refused.
+   * @param {string} params.outputAddress - Payout destination, explicit or confidential.
+   * @param {string} params.swapAssetId - Asset of the (unconfidential) swap input.
+   * @param {number | bigint | string} params.swapAmount - Amount of the swap input.
+   * @param {string} params.lockupTxHex - Transaction that created the swap input.
+   * @returns {Promise<{ pset: string, paymentOutputSecrets: { assetId: string, value: string, assetBlindingFactor: string, valueBlindingFactor: string } }>}
+   */
+  async fundLiquidPset ({
+    pset, swapInputIndex, paymentOutputIndex, policyAssetId, maxFeeSat,
+    outputAddress, swapAssetId, swapAmount, lockupTxHex
+  }) {
+    return this._run(async () => {
+      this._ensureReady()
+      const lwk = this._lwk
+      if (policyAssetId !== this._network.policyAsset().toString()) {
+        throw new Error('LiquidAccount.fundLiquidPset: policyAssetId is not this network\'s L-BTC')
+      }
+      const amount = BigInt(swapAmount)
+      const maxFee = BigInt(maxFeeSat)
+      const template = new lwk.Pset(pset)
+      const templateInputs = template.inputs()
+      const templateOutputs = template.outputs()
+      if (templateInputs.length !== 1 || swapInputIndex !== 0) {
+        throw new Error('LiquidAccount.fundLiquidPset: the template must hold only the swap input')
+      }
+      const payout = templateOutputs[paymentOutputIndex]
+      if (!payout) throw new RangeError(`fundLiquidPset paymentOutputIndex out of range: ${paymentOutputIndex}`)
+      const emptyScript = lwk.Script.empty().toString()
+      templateOutputs.forEach((output, index) => {
+        if (index !== paymentOutputIndex && output.scriptPubkey().toString() !== emptyScript) {
+          throw new Error('LiquidAccount.fundLiquidPset: the template holds an output besides the payout')
+        }
+      })
+      const address = this._parseRecipient(outputAddress)
+      const payoutScript = address.scriptPubkey().toString()
+      if (payoutScript !== payout.scriptPubkey().toString()) {
+        throw new Error('LiquidAccount.fundLiquidPset: outputAddress does not match the template payout')
+      }
+
+      const lockupTx = lwk.Transaction.fromString(lockupTxHex)
+      const swapTxid = templateInputs[0].previousTxid().toString()
+      const swapVout = templateInputs[0].previousVout()
+      if (lockupTx.txid().toString() !== swapTxid) {
+        throw new Error('LiquidAccount.fundLiquidPset: lockupTxHex is not the swap input\'s transaction')
+      }
+
+      await this._sync(true) // fee inputs must come from fresh UTXOs
+      const swapAsset = lwk.AssetId.fromString(swapAssetId)
+      const external = new lwk.ExternalUtxo(
+        swapVout,
+        lockupTx,
+        lwk.TxOutSecrets.fromExplicit(swapAsset, amount),
+        HTLC_SPEND_MAX_WEIGHT,
+        true
+      )
+      // Consuming builder — see `transfer`: reassign after every chain call.
+      let builder = this._network.txBuilder().addExternalUtxos([external])
+      builder = address.isBlinded()
+        ? builder.addRecipient(address, amount, swapAsset)
+        : this._addExplicitRecipient(builder, address, amount, swapAsset)
+      // The SDK checks the amount/asset proofs of every non-swap input.
+      builder = builder.addInputRangeproofs(true)
+      const built = builder.finish(this._wollet)
+
+      const fee = BigInt(this._wollet.psetDetails(built).balance().fee())
+      if (fee > maxFee) {
+        throw new Error(`LiquidAccount.fundLiquidPset: the network fee ${fee} sat exceeds the ${maxFee} sat cap`)
+      }
+      const signed = this._signer.sign(built)
+
+      const outputs = signed.outputs()
+      const payoutIndexes = outputs
+        .map((output, index) => (output.scriptPubkey().toString() === payoutScript ? index : -1))
+        .filter((index) => index >= 0)
+      if (payoutIndexes.length !== 1) {
+        throw new Error('LiquidAccount.fundLiquidPset: the built transaction does not hold exactly one payout')
+      }
+      const inputs = signed.inputs()
+      const swapInputs = inputs.filter(
+        (input) => input.previousTxid().toString() === swapTxid && input.previousVout() === swapVout
+      )
+      if (swapInputs.length !== 1) {
+        throw new Error('LiquidAccount.fundLiquidPset: the built transaction does not spend the swap input once')
+      }
+
+      let secrets
+      if (address.isBlinded()) {
+        // The factors are not readable from a PSET. Re-read the payout with the
+        // wallet's own blinding key through a throwaway Wollet, so the unsent
+        // transaction never touches this account's balance.
+        const probe = new lwk.Wollet(this._network, this._descriptor)
+        try {
+          probe.applyTransaction(signed.extractTx())
+          const txid = signed.extractTx().txid().toString()
+          const found = probe.txos().find(
+            (utxo) => utxo.outpoint().txid().toString() === txid && utxo.outpoint().vout() === payoutIndexes[0]
+          )
+          if (!found) {
+            throw new Error(
+              'LiquidAccount.fundLiquidPset: the payout is confidential for an address this wallet cannot unblind'
+            )
+          }
+          const unblinded = found.unblinded()
+          secrets = {
+            assetId: unblinded.asset().toString(),
+            value: unblinded.value(),
+            assetBlindingFactor: unblinded.assetBlindingFactor().toString(),
+            valueBlindingFactor: unblinded.valueBlindingFactor().toString()
+          }
+        } finally {
+          probe.free?.()
+        }
+      } else {
+        secrets = {
+          assetId: swapAssetId,
+          value: amount,
+          assetBlindingFactor: lwk.AssetBlindingFactor.zero().toString(),
+          valueBlindingFactor: lwk.ValueBlindingFactor.zero().toString()
+        }
+      }
+      if (secrets.assetId !== swapAssetId || BigInt(secrets.value) !== amount) {
+        throw new Error('LiquidAccount.fundLiquidPset: the payout does not carry the whole swap amount')
+      }
+      return { pset: signed.toString(), paymentOutputSecrets: { ...secrets, value: String(secrets.value) } }
     })
   }
 
