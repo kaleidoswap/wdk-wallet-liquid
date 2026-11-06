@@ -98,6 +98,69 @@ import {
  *   Persist a batch of newly observed records. Must be idempotent per outpoint.
  */
 
+const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+
+/**
+ * The leading byte of a base58 string, or null when it is not base58. Enough
+ * to read an Elements address version; the checksum is lwk's to verify.
+ *
+ * @param {string} text
+ * @returns {number | null}
+ */
+function base58LeadingByte (text) {
+  let value = 0n
+  for (const char of text) {
+    const digit = BASE58_ALPHABET.indexOf(char)
+    if (digit === -1) return null
+    value = value * 58n + BigInt(digit)
+  }
+  let hex = value.toString(16)
+  if (hex.length % 2) hex = '0' + hex
+  // Leading '1's are leading zero bytes.
+  let zeros = 0
+  for (const char of text) {
+    if (char !== '1') break
+    zeros++
+  }
+  if (zeros > 0) return 0
+  return hex.length === 0 ? null : parseInt(hex.slice(0, 2), 16)
+}
+
+// Elements address versions, per rust-elements AddressParams: blinded
+// prefix / P2PKH / P2SH for Liquid mainnet, Liquid testnet and regtest.
+const BASE58_CHAINS = {
+  12: 'mainnet',
+  57: 'mainnet',
+  39: 'mainnet',
+  23: 'testnet',
+  36: 'testnet',
+  19: 'testnet',
+  4: 'regtest',
+  235: 'regtest',
+  75: 'regtest'
+}
+
+/**
+ * The chain an address string belongs to, read from its bech32/blech32 HRP
+ * (`lq`/`ex`, `tlq`/`tex`, `el`/`ert`) or its base58 version byte. Null when
+ * neither says.
+ *
+ * @param {string} address
+ * @returns {'mainnet' | 'testnet' | 'regtest' | null}
+ */
+function addressChain (address) {
+  const lower = address.trim().toLowerCase()
+  const hrp = /^([a-z]+)1[02-9ac-hj-np-z]+$/.exec(lower)?.[1]
+  if (hrp) {
+    if (hrp === 'lq' || hrp === 'ex') return 'mainnet'
+    if (hrp === 'tlq' || hrp === 'tex') return 'testnet'
+    if (hrp === 'el' || hrp === 'ert') return 'regtest'
+    return null
+  }
+  const version = base58LeadingByte(address.trim())
+  return version == null ? null : (BASE58_CHAINS[version] ?? null)
+}
+
 function buildNetwork (binding, name) {
   switch (name) {
     case 'mainnet': return binding.Network.mainnet()
@@ -243,14 +306,28 @@ export class LiquidAccount {
         await this._esplora.setWaterfallsServerRecipient(this._waterfallsRecipient)
         this._waterfallsRecipientApplied = true
       }
-      const timeout = new Promise((_resolve, reject) => {
-        timer = setTimeout(
-          () => reject(new Error(`LiquidAccount: fullScan timed out after ${this._scanTimeoutMs}ms`)),
-          this._scanTimeoutMs
-        )
-      })
-      const update = await Promise.race([this._esplora.fullScan(this._wollet), timeout])
-      if (update) this._wollet.applyUpdate(update)
+      const scan = () => {
+        if (timer) clearTimeout(timer)
+        const timeout = new Promise((_resolve, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`LiquidAccount: fullScan timed out after ${this._scanTimeoutMs}ms`)),
+            this._scanTimeoutMs
+          )
+        })
+        return Promise.race([this._esplora.fullScan(this._wollet), timeout])
+      }
+      let update = await scan()
+      try {
+        if (update) this._wollet.applyUpdate(update)
+      } catch (err) {
+        // The wallet's status moved while this scan ran — a transaction this
+        // wallet broadcast was applied locally in between. The update was
+        // computed against the old status; compute it again against the new.
+        if (!/UpdateOnDifferentStatus/i.test(String(err?.message ?? err))) throw err
+        console.warn('[LiquidAccount] wallet changed during the scan; scanning again')
+        update = await scan()
+        if (update) this._wollet.applyUpdate(update)
+      }
       this._lastSyncAt = Date.now()
       console.info(`[LiquidAccount] ${scanKind} done in ${Date.now() - t0}ms`)
       // The scan that revealed an output is the one chance to record what it
@@ -482,12 +559,25 @@ export class LiquidAccount {
     try {
       return this._lwk.Address.parse(recipient, this._network)
     } catch (err) {
+      // `Address.parse` validated the network as well as the format; the
+      // lenient constructor validates neither beyond "is it an address", and
+      // `isMainnet()` cannot tell testnet from regtest. Read the chain off the
+      // address itself and require this account's: testnet funds to a regtest
+      // address are as lost as to a mainnet one.
       const address = new this._lwk.Address(recipient)
-      if (address.isMainnet() !== this._network.isMainnet()) {
+      const chain = addressChain(String(recipient))
+      if (chain !== this._chainName()) {
         throw err
       }
       return address
     }
+  }
+
+  /** The chain this account is on, as `addressChain` names them. */
+  _chainName () {
+    if (this._network.isMainnet()) return 'mainnet'
+    if (this._network.isRegtest()) return 'regtest'
+    return 'testnet'
   }
 
   /**
@@ -518,35 +608,37 @@ export class LiquidAccount {
   /**
    * Sends L-BTC on the Liquid network.
    *
+   * A fixed `amount` is paid in full and the fee is added on top of it, so
+   * it has to leave the fee's worth of L-BTC behind: an amount at or above
+   * the spendable balance is refused as insufficient funds. To send everything,
+   * pass `sendMax: true` and no amount — the wallet is drained to the
+   * recipient and the fee comes out of what they receive; the result's
+   * `amount` is what actually reached them.
+   *
    * NB: `feeRate` is in **sat/kvB** (lwk convention; its default is 100, i.e.
    * 0.1 sat/vB — the Liquid network minimum). Do NOT pass Bitcoin-style sat/vB
    * values: 1 sat/vB must be given as 1000. When omitted, lwk's default is used,
    * which is virtually always right on Liquid (federated 1-min blocks, no fee
    * market).
    *
-   * @param {{ recipient: string, amount: number | bigint, feeRate?: number }} options
-   * @returns {Promise<{ hash: string, fee: bigint }>}
+   * @param {{ recipient: string, amount?: number | bigint, feeRate?: number, sendMax?: boolean }} options
+   * @returns {Promise<{ hash: string, fee: bigint, amount: bigint }>}
+   *   `amount` is the L-BTC the recipient receives, net of fee for a drain.
    */
-  async transfer ({ recipient, amount, feeRate }) {
+  async transfer ({ recipient, amount, feeRate, sendMax = false }) {
     return this._run(async () => {
       await this._sync(true) // sends must build against fresh UTXOs
       const address = this._parseRecipient(recipient)
-      const requested = BigInt(amount)
       // lwk's TxBuilder is a CONSUMING builder (wasm-bindgen moves `self`):
       // every chain method invalidates the receiver and returns a fresh
       // builder. Reusing the old reference throws "null pointer passed to
       // rust" — always reassign.
       let builder = this._network.txBuilder()
-      // Send-max: `addLbtcRecipient` adds the fee ON TOP of the amount, so
-      // requesting the entire L-BTC balance leaves nothing to cover the fee and
-      // lwk fails with "Insufficient funds: missing <fee> units for asset
-      // <L-BTC>". When the requested amount is the whole spendable balance,
-      // drain instead — it sends every L-BTC input to the recipient with the
-      // fee deducted from the amount. (You can never send more than the balance,
-      // so `>=` uniquely means "send all, net of fee".)
-      const policyBalance = this._balanceOf(this._network.policyAsset().toString())
+      const policyAsset = this._network.policyAsset()
+      const policyBalance = this._balanceOf(policyAsset.toString())
       const explicit = !address.isBlinded()
-      if (requested >= policyBalance) {
+      let requested = null
+      if (sendMax) {
         // Send-max to an explicit address has no working form: draining leaves
         // the recipient as the only non-fee output, so nothing in the
         // transaction is blinded and `finish()` dies in lwk's `blind_last`
@@ -556,23 +648,43 @@ export class LiquidAccount {
           throw new Error(
             'LiquidAccount.transfer: cannot send the whole L-BTC balance to an unconfidential address — ' +
             'the drained transaction would have no blinded output for lwk to blind. ' +
-            'Send less than the full balance, or use a confidential recipient.'
+            'Send a fixed amount below the balance, or use a confidential recipient.'
           )
         }
+        if (policyBalance <= 0n) {
+          throw new Error('LiquidAccount.transfer: Insufficient funds: no L-BTC to send')
+        }
+        // `addLbtcRecipient` adds the fee ON TOP of the amount, so the whole
+        // balance can only leave as a drain: every L-BTC input goes to the
+        // recipient and the fee is deducted from what they get.
         builder = builder.drainLbtcWallet()
         builder = builder.drainLbtcTo(address)
-      } else if (explicit) {
-        builder = this._addExplicitRecipient(
-          builder,
-          address,
-          requested,
-          this._network.policyAsset()
-        )
       } else {
-        builder = builder.addLbtcRecipient(address, requested)
+        requested = BigInt(amount ?? 0)
+        if (requested <= 0n) {
+          throw new Error('LiquidAccount.transfer: amount must be a positive number of satoshis')
+        }
+        // The fee is paid on top of a fixed amount, so the balance has to
+        // exceed it. Anything else is not "send what you can", it is a request
+        // the wallet cannot honour as asked — and must not reinterpret.
+        if (requested >= policyBalance) {
+          throw new Error(
+            `LiquidAccount.transfer: Insufficient funds: requested ${requested} sat but only ` +
+            `${policyBalance} sat of L-BTC is spendable and the fee is paid on top. ` +
+            'To send everything, pass sendMax: true.'
+          )
+        }
+        builder = explicit
+          ? this._addExplicitRecipient(builder, address, requested, policyAsset)
+          : builder.addLbtcRecipient(address, requested)
       }
       if (feeRate != null) builder = builder.feeRate(feeRate)
-      return this._buildSignBroadcast(builder)
+      const sent = await this._buildSignBroadcast(builder)
+      // What the recipient receives: the fixed amount, or for a drain the
+      // wallet's L-BTC outflow less the fee it paid.
+      const outflow = sent.outflows.get(policyAsset.toString())
+      const received = requested ?? (outflow == null ? null : outflow - sent.fee)
+      return { hash: sent.hash, fee: sent.fee, amount: received }
     })
   }
 
@@ -1000,6 +1112,10 @@ export class LiquidAccount {
   async sendAsset ({ assetId, recipient, amount, feeRate }) {
     return this._run(async () => {
       await this._sync(true) // sends must build against fresh UTXOs
+      const units = BigInt(amount ?? 0)
+      if (units <= 0n) {
+        throw new Error('LiquidAccount.sendAsset: amount must be a positive number of units')
+      }
       // Consuming builder — see `transfer`: reassign after every chain call.
       let builder = this._network.txBuilder()
       // Same split as `transfer`: an explicit recipient cannot go through
@@ -1007,10 +1123,11 @@ export class LiquidAccount {
       const address = this._parseRecipient(recipient)
       const asset = this._lwk.AssetId.fromString(assetId)
       builder = address.isBlinded()
-        ? builder.addRecipient(address, BigInt(amount), asset)
-        : this._addExplicitRecipient(builder, address, BigInt(amount), asset)
+        ? builder.addRecipient(address, units, asset)
+        : this._addExplicitRecipient(builder, address, units, asset)
       if (feeRate != null) builder = builder.feeRate(feeRate)
-      return this._buildSignBroadcast(builder)
+      const sent = await this._buildSignBroadcast(builder)
+      return { hash: sent.hash, fee: sent.fee, amount: units }
     })
   }
 
@@ -1019,15 +1136,50 @@ export class LiquidAccount {
    *
    * @private
    * @param {import('lwk_wasm').TxBuilder} builder
-   * @returns {Promise<{ hash: string, fee: bigint }>}
+   * @returns {Promise<{ hash: string, fee: bigint, outflows: Map<string, bigint> }>}
+   *   `outflows` is what the transaction takes out of this wallet per asset,
+   *   as positive amounts (fee included for L-BTC).
    */
   async _buildSignBroadcast (builder) {
     let pset = builder.finish(this._wollet)
-    const fee = this._wollet.psetDetails(pset).balance().fee()
+    const balance = this._wollet.psetDetails(pset).balance()
+    const fee = BigInt(balance.fee())
+    const outflows = new Map()
+    const entries = typeof balance.balances === 'function' ? balance.balances()?.entries?.() : null
+    if (entries) {
+      for (const [asset, delta] of entries) {
+        if (BigInt(delta) < 0n) outflows.set(String(asset), -BigInt(delta))
+      }
+    }
     pset = this._signer.sign(pset)
     pset = this._wollet.finalize(pset)
     const txid = await this._esplora.broadcast(pset)
-    return { hash: txid.toString(), fee: BigInt(fee) }
+    this._applyBroadcast(pset)
+    return { hash: txid.toString(), fee, outflows }
+  }
+
+  /**
+   * Makes a transaction this wallet just broadcast part of its own state at
+   * once: the inputs it spent are gone and its change is there, so a send
+   * that follows cannot pick the same inputs, and a balance read right after
+   * does not report the pre-send amount. The next sync is also no longer
+   * "fresh": the chain has to be scanned again for what the broadcast did.
+   *
+   * @private
+   * @param {object} pset - The finalized PSET that was broadcast.
+   */
+  _applyBroadcast (pset) {
+    try {
+      if (typeof pset?.extractTx === 'function' && typeof this._wollet?.applyTransaction === 'function') {
+        this._wollet.applyTransaction(pset.extractTx())
+      }
+    } catch (err) {
+      // The broadcast already happened; the next scan will show the
+      // transaction. Only the shortcut is lost.
+      console.warn('[LiquidAccount] could not apply the broadcast transaction locally:', err?.message ?? err)
+    } finally {
+      this._lastSyncAt = 0
+    }
   }
 
   /**

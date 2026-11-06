@@ -251,7 +251,7 @@ describe('LiquidAccount', () => {
 
     account._lastSyncAt = Date.now() // fresh — the forced pre-send scan is skipped
     const btc = await account.transfer({ recipient: addr, amount: 1000n })
-    expect(btc).toEqual({ hash: 'txid-stub', fee: 250n })
+    expect(btc).toEqual({ hash: 'txid-stub', fee: 250n, amount: 1000n })
     expect(state.drainWallet).toBe(0) // partial amount → no drain
 
     account._lastSyncAt = Date.now()
@@ -261,7 +261,7 @@ describe('LiquidAccount', () => {
       amount: 5,
       feeRate: 100
     })
-    expect(asset).toEqual({ hash: 'txid-stub', fee: 250n })
+    expect(asset).toEqual({ hash: 'txid-stub', fee: 250n, amount: 5n })
     expect(state.recipients).toHaveLength(2)
     expect(state.feeRates).toEqual([100]) // only the explicit sendAsset feeRate
 
@@ -604,10 +604,10 @@ describe('LiquidAccount', () => {
     account.dispose()
   })
 
-  test('transfer of the full L-BTC balance drains (fee deducted, not added on top)', async () => {
+  test('sendMax drains the wallet and reports what the recipient got, net of fee', async () => {
     // addLbtcRecipient(fullBalance) would add the fee ON TOP → lwk "Insufficient
-    // funds: missing <fee> units for asset <L-BTC>". Sending the entire balance
-    // must drain instead (drainLbtcWallet + drainLbtcTo), which nets out the fee.
+    // funds: missing <fee> units for asset <L-BTC>". Sending everything is an
+    // explicit drain (drainLbtcWallet + drainLbtcTo), which nets out the fee.
     const account = new LiquidAccount({ mnemonic: SEED })
     account._ensureReady()
     const addr = await account.getAddress()
@@ -626,18 +626,110 @@ describe('LiquidAccount', () => {
     account._network.txBuilder = () => makeBuilder()
     account._network.policyAsset = () => ({ toString: () => 'lbtc' })
     account._wollet.balance = () => new Map([['lbtc', 5_000n]])
-    account._wollet.psetDetails = () => ({ balance: () => ({ fee: () => 42 }) })
+    account._wollet.psetDetails = () => ({
+      balance: () => ({ fee: () => 42, balances: () => new Map([['lbtc', -5_000n]]) })
+    })
     account._signer.sign = (pset) => pset
     account._wollet.finalize = (pset) => pset
     account._esplora = { fullScan: async () => null, broadcast: async () => 'txid-max' }
 
     account._lastSyncAt = Date.now()
-    const res = await account.transfer({ recipient: addr, amount: 5_000n }) // == full balance
-    expect(res).toEqual({ hash: 'txid-max', fee: 42n })
+    const res = await account.transfer({ recipient: addr, sendMax: true })
+    expect(res).toEqual({ hash: 'txid-max', fee: 42n, amount: 4_958n })
     expect(calls.drainWallet).toBe(1)
     expect(calls.drainTo).toBe(1)
     expect(calls.addLbtc).toBe(0) // never the fee-on-top path
 
+    account.dispose()
+  })
+
+  test('a fixed amount at or above the balance is refused, never reinterpreted as a drain', async () => {
+    // Before, `amount >= balance` silently became "send all": a request for
+    // balance + 1 broadcast a drain of balance - fee. A fixed amount is a fixed
+    // amount; the wallet either pays it with the fee on top or refuses.
+    const account = new LiquidAccount({ mnemonic: SEED })
+    account._ensureReady()
+    const addr = await account.getAddress()
+    const calls = { addLbtc: 0, drainWallet: 0, drainTo: 0, finish: 0 }
+    function makeBuilder () {
+      return {
+        addLbtcRecipient () { calls.addLbtc++; return makeBuilder() },
+        drainLbtcWallet () { calls.drainWallet++; return makeBuilder() },
+        drainLbtcTo () { calls.drainTo++; return makeBuilder() },
+        feeRate () { return makeBuilder() },
+        finish () { calls.finish++; return { fake: 'pset' } }
+      }
+    }
+    account._network.txBuilder = () => makeBuilder()
+    account._network.policyAsset = () => ({ toString: () => 'lbtc' })
+    account._wollet.balance = () => new Map([['lbtc', 5_000n]])
+    account._esplora = { fullScan: async () => null, broadcast: async () => { throw new Error('must not broadcast') } }
+    account._lastSyncAt = Date.now()
+
+    for (const amount of [5_001n, 5_000n, 0n]) {
+      await expect(account.transfer({ recipient: addr, amount })).rejects.toThrow(/Insufficient funds|positive/)
+    }
+    expect(calls.finish).toBe(0) // refused before anything is built or signed
+    expect(calls.drainWallet).toBe(0)
+
+    // Just under the balance is a plain fixed send, fee on top.
+    account._wollet.psetDetails = () => ({ balance: () => ({ fee: () => 42 }) })
+    account._signer.sign = (pset) => pset
+    account._wollet.finalize = (pset) => pset
+    account._esplora.broadcast = async () => 'txid-fixed'
+    const res = await account.transfer({ recipient: addr, amount: 4_999n })
+    expect(res).toEqual({ hash: 'txid-fixed', fee: 42n, amount: 4_999n })
+    expect(calls.addLbtc).toBe(1)
+
+    account.dispose()
+  })
+
+  test('a broadcast transaction is applied locally and the next sync rescans', async () => {
+    // Until the chain is scanned again the Wollet would still hold the spent
+    // inputs: a second send right after the first could pick them, and a
+    // balance read would report the pre-send amount.
+    const account = new LiquidAccount({ mnemonic: SEED })
+    account._ensureReady()
+    const addr = await account.getAddress()
+    const applied = []
+    const tx = { kind: 'tx' }
+    account._network.txBuilder = () => ({
+      addLbtcRecipient () { return this },
+      feeRate () { return this },
+      finish () { return { extractTx: () => tx } }
+    })
+    account._network.policyAsset = () => ({ toString: () => 'lbtc' })
+    account._wollet.balance = () => new Map([['lbtc', 5_000n]])
+    account._wollet.psetDetails = () => ({ balance: () => ({ fee: () => 42 }) })
+    account._wollet.applyTransaction = (t) => { applied.push(t) }
+    account._signer.sign = (pset) => pset
+    account._wollet.finalize = (pset) => pset
+    let scans = 0
+    account._esplora = { fullScan: async () => { scans++; return null }, broadcast: async () => 'txid-applied' }
+    account._lastSyncAt = Date.now()
+
+    await account.transfer({ recipient: addr, amount: 1_000n })
+    expect(applied).toEqual([tx])
+    expect(account._lastSyncAt).toBe(0) // the chain has to be read again
+    await account._sync() // a plain read right after the send scans, it is not "fresh"
+    expect(scans).toBe(1)
+
+    account.dispose()
+  })
+
+  test('a sync whose update no longer matches the wallet status scans again once', async () => {
+    const account = new LiquidAccount({ mnemonic: SEED })
+    account._ensureReady()
+    let scans = 0
+    let applies = 0
+    account._esplora = { fullScan: async () => { scans++; return { scan: scans } } }
+    account._wollet.applyUpdate = () => {
+      applies++
+      if (applies === 1) throw new Error('UpdateOnDifferentStatus')
+    }
+    await account._sync()
+    expect(scans).toBe(2)
+    expect(applies).toBe(2)
     account.dispose()
   })
 
@@ -708,7 +800,7 @@ describe('LiquidAccount', () => {
     expect(explicit.startsWith('tex1')).toBe(true) // unconfidential testnet
 
     const res = await account.transfer({ recipient: explicit, amount: 1000n })
-    expect(res).toEqual({ hash: 'txid-explicit', fee: 100n })
+    expect(res).toEqual({ hash: 'txid-explicit', fee: 100n, amount: 1000n })
     expect(calls.addExplicit).toBe(1)
     expect(calls.sats).toEqual([1000n])
     expect(calls.addLbtc).toBe(0) // the blinding path must not be taken
@@ -739,7 +831,7 @@ describe('LiquidAccount', () => {
       recipient: explicit,
       amount: 5
     })
-    expect(res).toEqual({ hash: 'txid-explicit', fee: 100n })
+    expect(res).toEqual({ hash: 'txid-explicit', fee: 100n, amount: 5n })
     expect(calls.addExplicit).toBe(1)
     expect(calls.addRecipient).toBe(0)
 
@@ -770,14 +862,14 @@ describe('LiquidAccount', () => {
     const account = await sendableAccount(calls)
     const explicit = await explicitAddressOf(account)
 
-    await expect(account.transfer({ recipient: explicit, amount: 1_000_000n }))
+    await expect(account.transfer({ recipient: explicit, sendMax: true }))
       .rejects.toThrow(/whole L-BTC balance to an unconfidential address/)
     expect(calls.drainWallet).toBe(0) // rejected before touching the builder
     expect(calls.drainTo).toBe(0)
 
     // The same send-max to a confidential address still drains.
     const confidential = await account.getAddress()
-    await account.transfer({ recipient: confidential, amount: 1_000_000n })
+    await account.transfer({ recipient: confidential, sendMax: true })
     expect(calls.drainTo).toBe(1)
 
     account.dispose()
@@ -823,6 +915,29 @@ describe('LiquidAccount', () => {
     })).rejects.toThrow()
     expect(calls.addExplicit).toBe(0)
     expect(calls.addLbtc).toBe(0)
+
+    account.dispose()
+  })
+
+  test('a regtest explicit recipient is rejected by a testnet account', async () => {
+    // Testnet and regtest are both "not mainnet", which is all the lenient
+    // constructor can tell; the fallback reads the HRP so `ert1…` is refused
+    // by a testnet account exactly like `lq1…` is.
+    const regtest = new LiquidAccount({ mnemonic: SEED, network: 'regtest' })
+    regtest._ensureReady()
+    const regtestExplicit = await explicitAddressOf(regtest)
+    expect(regtestExplicit.startsWith('ert1')).toBe(true)
+    regtest.dispose()
+
+    const calls = noCalls()
+    const account = await sendableAccount(calls)
+    await expect(account.transfer({ recipient: regtestExplicit, amount: 1000n })).rejects.toThrow()
+    expect(calls.addExplicit).toBe(0)
+
+    // Its own chain's explicit address still goes through.
+    const ownExplicit = await explicitAddressOf(account)
+    await account.transfer({ recipient: ownExplicit, amount: 1000n })
+    expect(calls.addExplicit).toBe(1)
 
     account.dispose()
   })
