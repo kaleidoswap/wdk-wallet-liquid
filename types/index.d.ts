@@ -100,6 +100,13 @@ export interface TransferResult {
   hash: string
   /** The transaction fee in satoshis. */
   fee: bigint
+  /**
+   * What the recipient receives, in the asset's smallest unit: the fixed
+   * amount that was requested, or for a `sendMax` drain the wallet's L-BTC
+   * outflow less the fee. Null only when the binding cannot report the
+   * drained outflow.
+   */
+  amount: bigint | null
 }
 
 export interface KeyPair {
@@ -224,7 +231,12 @@ export class LiquidAccount {
   getAddress (): Promise<string>
   getBalance (): Promise<bigint>
   getTokenBalance (assetId: string): Promise<bigint>
-  transfer (options: { recipient: string, amount: number | bigint, feeRate?: number }): Promise<TransferResult>
+  /**
+   * Send L-BTC. A fixed `amount` is paid in full with the fee on top, and is
+   * refused when it is not below the spendable balance. `sendMax: true` drains
+   * the wallet to a confidential recipient instead, fee deducted.
+   */
+  transfer (options: { recipient: string, amount?: number | bigint, feeRate?: number, sendMax?: boolean }): Promise<TransferResult>
   sign (message: string): Promise<string>
   getSimplicityCapabilities (): SimplicityCapabilities
   inspectPset (psetBase64: string): Promise<LiquidPsetReview>

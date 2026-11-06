@@ -101,7 +101,8 @@ await account.getAddress()                 // next CT receive address
 await account.getBalance()                 // L-BTC balance (satoshis, bigint)
 await account.getTokenBalance(assetId)      // any Liquid asset balance
 
-await account.transfer({ recipient, amount, feeRate })
+await account.transfer({ recipient, amount, feeRate })   // fixed amount, fee on top
+await account.transfer({ recipient, sendMax: true })      // everything, fee deducted
 await account.sendAsset({ assetId, recipient, amount, feeRate })
 
 await account.listAssets()
@@ -125,6 +126,20 @@ const signed = await account.signPset({ pset: review.pset, inputIndexes: [0] })
 wallet.dispose()
 ```
 
+### Amounts and send-max
+
+A fixed `amount` is what the recipient gets; the fee is paid on top of it, so
+the amount has to be below the spendable L-BTC balance or `transfer` refuses
+it as insufficient funds — it never quietly sends something else instead. To
+send everything, pass `sendMax: true` (and no amount): the wallet is drained
+to the recipient and the fee comes out of what they receive. Both forms
+resolve to `{ hash, fee, amount }`, where `amount` is what actually reached
+the recipient.
+
+After a broadcast the account applies the transaction to its own state at
+once, so a second send cannot reuse the inputs the first one spent, and marks
+its chain view stale so the next read scans again.
+
 ### Unconfidential recipients
 
 Liquid addresses come confidential (`lq1…` / `tlq1…`) or explicit (`ex1…` /
@@ -134,7 +149,8 @@ limits apply to the explicit path:
 
 - **Send-max is refused.** Draining the whole L-BTC balance to an explicit
   address leaves the transaction with no blinded output for LWK to blind, which
-  it rejects. Send less than the full balance, or use a confidential recipient.
+  it rejects. Send a fixed amount below the balance, or use a confidential
+  recipient.
 - **Not available on React Native.** `lwk-rn` has no `addExplicitRecipient()`,
   so the call throws a readable error there rather than building a transaction
   that cannot be blinded.
