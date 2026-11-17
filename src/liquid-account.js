@@ -197,6 +197,69 @@ const DEFAULT_SCAN_TIMEOUT_MS = 30_000
 // headroom; the cap check in `fundLiquidPset` bounds an over-estimate.
 const HTLC_SPEND_MAX_WEIGHT = 400
 
+// LWK `Update` magic. A version-2 update with `wollet_status` 0 is applied
+// without the status check, and the all-zero dynafed header below is the
+// sentinel `apply_update` treats as "no tip", so the update only inserts scripts.
+const UPDATE_MAGIC = Uint8Array.from([0x89, 0x61, 0xb8, 0xc8])
+const UPDATE_NO_TIP = Uint8Array.from([
+  0x00, 0x00, 0x00, 0x80, // dynafed version bit, height 0
+  ...new Uint8Array(32), // prev block hash
+  ...new Uint8Array(32), // merkle root
+  0, 0, 0, 0, // time
+  0, 0, 0, 0, // height
+  0, 0, 0 // Null dynafed params, empty signblock witness
+])
+
+function concatBytes (parts) {
+  const total = parts.reduce((sum, part) => sum + part.length, 0)
+  const out = new Uint8Array(total)
+  let offset = 0
+  for (const part of parts) {
+    out.set(part, offset)
+    offset += part.length
+  }
+  return out
+}
+
+function u32le (value) {
+  const out = new Uint8Array(4)
+  new DataView(out.buffer).setUint32(0, value, true)
+  return out
+}
+
+/**
+ * An LWK `Update` (version 2) whose only effect is to put `scriptBytes` in a
+ * Wollet's script index.
+ *
+ * `applyTransaction` unblinds an output only when that output's script is
+ * already in `cache.paths`. A Wollet that has never been scanned has an empty
+ * index, so it ignores every output — including addresses this descriptor
+ * derives at any index. The scan window is not the gate: nothing is indexed
+ * until an update says so. Unblinding itself is SLIP-77 over the script, so
+ * the derivation index stored here is not consulted; 0 stands in for it.
+ *
+ * @param {Uint8Array} scriptBytes Raw script pubkey (no length prefix).
+ * @returns {Uint8Array}
+ */
+function scriptIndexUpdate (scriptBytes) {
+  if (scriptBytes.length >= 0xfd) {
+    throw new Error('LiquidAccount.fundLiquidPset: payout script is too long to index')
+  }
+  return concatBytes([
+    UPDATE_MAGIC,
+    Uint8Array.from([2]), // version
+    new Uint8Array(8), // wollet_status 0 — skip the status check
+    Uint8Array.from([0, 0]), // no transactions, no unblinds
+    Uint8Array.from([0, 0, 0]), // no heights, deletions, or timestamps
+    Uint8Array.from([1, scriptBytes.length]),
+    scriptBytes,
+    Uint8Array.from([0]), // external chain
+    u32le(0),
+    new Uint8Array(33), // blinding pubkey left for the descriptor to fill in
+    UPDATE_NO_TIP
+  ])
+}
+
 /**
  * WDK-compatible account that wraps an in-process LWK (Liquid Wallet Kit)
  * watch-only `Wollet` plus a software `Signer` derived from a BIP-39 mnemonic.
@@ -978,16 +1041,35 @@ export class LiquidAccount {
         // The factors are not readable from a PSET. Re-read the payout with the
         // wallet's own blinding key through a throwaway Wollet, so the unsent
         // transaction never touches this account's balance.
+        //
+        // The probe has never been scanned, so its script index is empty and
+        // `applyTransaction` would skip the payout even when `outputAddress` is
+        // this account's own receive address (any derivation index, including
+        // one past a gap limit). Index the payout script first. A foreign
+        // confidential address is blinded to a key this descriptor does not
+        // hold, so it still does not unblind — and it is not rewritten as an
+        // explicit output.
+        if (typeof lwk.Update !== 'function') {
+          throw new Error(
+            'LiquidAccount.fundLiquidPset: the active LWK binding cannot index a script, so a confidential payout cannot be unblinded'
+          )
+        }
+        const scriptBytes = address.scriptPubkey().bytes()
         const probe = new lwk.Wollet(this._network, this._descriptor)
+        const update = new lwk.Update(scriptIndexUpdate(scriptBytes))
         try {
-          probe.applyTransaction(signed.extractTx())
-          const txid = signed.extractTx().txid().toString()
+          probe.applyUpdate(update)
+          const tx = signed.extractTx()
+          probe.applyTransaction(tx)
+          const txid = tx.txid().toString()
           const found = probe.txos().find(
             (utxo) => utxo.outpoint().txid().toString() === txid && utxo.outpoint().vout() === payoutIndexes[0]
           )
           if (!found) {
             throw new Error(
-              'LiquidAccount.fundLiquidPset: the payout is confidential for an address this wallet cannot unblind'
+              'LiquidAccount.fundLiquidPset: the payout is confidential and this account cannot unblind it' +
+              ` (${outputAddress}). The output was blinded to a key this wallet does not hold,` +
+              ' so the address is not a confidential address of this account.'
             )
           }
           const unblinded = found.unblinded()
@@ -998,6 +1080,7 @@ export class LiquidAccount {
             valueBlindingFactor: unblinded.valueBlindingFactor().toString()
           }
         } finally {
+          update.free?.()
           probe.free?.()
         }
       } else {
