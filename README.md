@@ -1,4 +1,4 @@
-# @kaleidorg/wdk-wallet-liquid
+# @kaleidoswap/wdk-wallet-liquid
 
 WDK wallet adapter for the **Liquid** network. Wraps an in-process
 [LWK (Liquid Wallet Kit)](https://github.com/Blockstream/lwk) wallet in the
@@ -11,7 +11,7 @@ It is the wallet foundation for KaleidoSwap's native Liquid DEX
 ## Install
 
 ```sh
-npm install @kaleidorg/wdk-wallet-liquid @tetherto/wdk-wallet
+npm install @kaleidoswap/wdk-wallet-liquid @tetherto/wdk-wallet
 ```
 
 `@tetherto/wdk-wallet` is a peer dependency.
@@ -92,7 +92,7 @@ account — `getAccount(index)` always returns the same `LiquidAccount`.
 ## Usage
 
 ```js
-import LiquidWalletManager from '@kaleidorg/wdk-wallet-liquid'
+import LiquidWalletManager from '@kaleidoswap/wdk-wallet-liquid'
 
 const wallet = new LiquidWalletManager(mnemonic, { network: 'testnet' })
 const account = await wallet.getAccount()
